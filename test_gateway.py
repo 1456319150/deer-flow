@@ -23,7 +23,6 @@ class TestLoadDotenv(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
             f.write("FOO=bar\nBAZ=qux\n")
             f.flush()
-            # Clear any existing values
             os.environ.pop("FOO", None)
             os.environ.pop("BAZ", None)
             load_dotenv(f.name)
@@ -57,7 +56,6 @@ class TestLoadDotenv(unittest.TestCase):
         os.environ.pop("KEY", None)
 
     def test_existing_env_not_overridden(self):
-        """Existing env vars should take priority over .env file."""
         os.environ["PRIORITY"] = "from_env"
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
             f.write("PRIORITY=from_file\n")
@@ -68,8 +66,7 @@ class TestLoadDotenv(unittest.TestCase):
         os.environ.pop("PRIORITY", None)
 
     def test_missing_file_no_error(self):
-        """Missing .env file should silently pass."""
-        load_dotenv("/nonexistent/.env")  # Should not raise
+        load_dotenv("/nonexistent/.env")
 
 
 class TestLoadConfig(unittest.TestCase):
@@ -91,7 +88,6 @@ class TestLoadConfig(unittest.TestCase):
             f.write("key: $NONEXISTENT_VAR\n")
             f.flush()
             cfg = load_config(f.name)
-            # YAML parses bare empty string as None
             self.assertIn(cfg["key"], ("", None))
         os.unlink(f.name)
 
@@ -152,6 +148,106 @@ class TestExtractJson(unittest.TestCase):
         parsed = ClaudeCodeBridge._extract_json(output)
         self.assertEqual(parsed["result"], "good")
 
+    def test_multiline_json(self):
+        """Multi-line JSON should be handled by pass 2 (brace matching)."""
+        output = (
+            'Some log line\n'
+            '{\n'
+            '  "result": "multiline answer",\n'
+            '  "session_id": "s5"\n'
+            '}\n'
+            'trailing log\n'
+        )
+        parsed = ClaudeCodeBridge._extract_json(output)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["result"], "multiline answer")
+
+
+class TestExtractResult(unittest.TestCase):
+    """Test ClaudeCodeBridge._extract_result() — finding text in various JSON shapes."""
+
+    def test_result_field(self):
+        parsed = {"result": "hello", "session_id": "abc"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "hello")
+
+    def test_content_field(self):
+        """Some responses use 'content' instead of 'result'."""
+        parsed = {"content": "from content field", "session_id": "abc"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from content field")
+
+    def test_text_field(self):
+        parsed = {"text": "from text field", "session_id": "abc"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from text field")
+
+    def test_output_field(self):
+        parsed = {"output": "from output field", "session_id": "abc"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from output field")
+
+    def test_message_field(self):
+        parsed = {"message": "from message field", "session_id": "abc"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from message field")
+
+    def test_result_priority_over_content(self):
+        """'result' should take priority over 'content'."""
+        parsed = {"result": "from result", "content": "from content", "session_id": "abc"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from result")
+
+    def test_empty_result_falls_to_content(self):
+        """Empty 'result' should fall through to 'content'."""
+        parsed = {"result": "", "content": "actual answer", "session_id": "abc"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "actual answer")
+
+    def test_nested_data_field(self):
+        parsed = {"data": {"result": "nested answer"}, "session_id": "abc"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "nested answer")
+
+    def test_choices_openai_format(self):
+        parsed = {"choices": [{"message": {"content": "from choices"}}]}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from choices")
+
+    def test_result_is_list_of_dicts(self):
+        parsed = {"result": [{"text": "part 1"}, {"text": "part 2"}], "session_id": "abc"}
+        result = ClaudeCodeBridge._extract_result(parsed)
+        self.assertIn("part 1", result)
+        self.assertIn("part 2", result)
+
+    def test_all_empty_returns_empty(self):
+        parsed = {"session_id": "abc", "status": "ok"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "")
+
+    def test_whitespace_only_skipped(self):
+        parsed = {"result": "   ", "content": "real answer"}
+        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "real answer")
+
+
+class TestCollectStrings(unittest.TestCase):
+    """Test ClaudeCodeBridge._collect_strings() — fallback string extraction."""
+
+    def test_flat_dict(self):
+        out = []
+        ClaudeCodeBridge._collect_strings({"a": "hello", "b": "world"}, out)
+        self.assertIn("hello", out)
+        self.assertIn("world", out)
+
+    def test_skip_keys(self):
+        out = []
+        ClaudeCodeBridge._collect_strings(
+            {"session_id": "skip_me", "text": "keep_me"},
+            out, skip_keys={"session_id"}
+        )
+        self.assertNotIn("skip_me", out)
+        self.assertIn("keep_me", out)
+
+    def test_nested(self):
+        out = []
+        ClaudeCodeBridge._collect_strings({"a": {"b": "deep value"}}, out)
+        self.assertIn("deep value", out)
+
+    def test_trivial_strings_skipped(self):
+        out = []
+        ClaudeCodeBridge._collect_strings({"a": "ok", "b": "x"}, out)
+        self.assertEqual(len(out), 0)  # "ok" and "x" are ≤ 2 chars
+
 
 class TestBuildCmd(unittest.TestCase):
     """Test ClaudeCodeBridge._build_cmd() — CLI command construction."""
@@ -203,7 +299,6 @@ class TestBuildCmd(unittest.TestCase):
     def test_single_quote_escaping(self):
         cmd = self.bridge._build_cmd("it's a test", None)
         a_arg = cmd[7]
-        # Should not contain bare single quotes that break shell
         self.assertNotIn("it's", a_arg)
 
     def test_newline_escaping(self):
@@ -283,7 +378,6 @@ class TestSessionManagement(unittest.TestCase):
 
     def test_session_stored_on_response(self):
         bridge = ClaudeCodeBridge({})
-        # Simulate _parse response updating session
         bridge._sessions["topic_1"] = "session_abc"
         self.assertEqual(bridge._sessions.get("topic_1"), "session_abc")
 
@@ -301,12 +395,9 @@ class TestBridgeAskMocked(unittest.TestCase):
         bridge = ClaudeCodeBridge({"timeout": 1, "ttadk_cmd": "sleep"})
 
         async def run():
-            result = await bridge.ask("t1", "test")
-            return result
+            return await bridge.ask("t1", "test")
 
-        # sleep as ttadk_cmd will cause argument errors but tests the flow
         result = asyncio.get_event_loop().run_until_complete(run())
-        # Should return some string (either timeout or error)
         self.assertIsInstance(result, str)
         self.assertTrue(len(result) > 0)
 

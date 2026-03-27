@@ -66,6 +66,13 @@ def load_config(path: str = "config.yaml") -> dict:
 # Claude Code Bridge — ttadk CLI wrapper
 # ===========================================================================
 
+# Fields where ttadk may put the actual text response, in priority order
+_RESULT_FIELDS = ("result", "content", "text", "output", "response", "message", "answer")
+
+# Fields that hold session identifiers
+_SESSION_FIELDS = ("session_id", "conversation_id", "uuid")
+
+
 class ClaudeCodeBridge:
     """Calls Claude Code via ttadk subprocess. Tracks sessions per topic."""
 
@@ -75,17 +82,17 @@ class ClaudeCodeBridge:
         self.target: str = cfg.get("target", "claude")
         self.timeout: int = cfg.get("timeout", 600)
         self.allowed_tools: str = cfg.get("allowed_tools", "Bash,Read,Write,Edit")
-        self.system_prompt: str = cfg.get(
-            "system_prompt",
-            "You are a helpful AI assistant. Always respond in the user's language. "
-            "After using tools, summarize findings in text.",
-        )
+        # NOTE: --system-prompt breaks Claude Code's built-in agent loop.
+        # Instead, we prepend custom instructions to the user prompt.
+        self.instruction: str = cfg.get("instruction", "")
         self._sessions: dict[str, str] = {}  # topic_id → session_id
 
     async def ask(self, topic_id: str, prompt: str) -> str:
         """Send prompt to Claude Code, return text response."""
         session_id = self._sessions.get(topic_id)
-        cmd = self._build_cmd(prompt, session_id)
+        # Prepend custom instruction (if any) to user prompt
+        full_prompt = f"{self.instruction}\n\n{prompt}" if self.instruction else prompt
+        cmd = self._build_cmd(full_prompt, session_id)
 
         log.info("[Bridge] topic=%s session=%s prompt=%d chars", topic_id, session_id, len(prompt))
 
@@ -119,15 +126,87 @@ class ClaudeCodeBridge:
             tail = "\n".join(raw.strip().splitlines()[-20:])
             return tail or "(empty response)"
 
+        log.debug("[Bridge] parsed keys=%s", list(parsed.keys()))
+
         # Update session for multi-turn continuity
-        for key in ("session_id", "conversation_id", "uuid"):
+        for key in _SESSION_FIELDS:
             sid = parsed.get(key)
             if sid:
                 self._sessions[topic_id] = sid
                 log.info("[Bridge] session: topic=%s → %s", topic_id, sid)
                 break
 
-        return parsed.get("result", "") or "(empty result)"
+        # Extract result text — try multiple known field names
+        result = self._extract_result(parsed)
+        if result:
+            return result
+
+        # result is empty — this happens when Claude Code used tools
+        # (e.g. Read to show file contents) but didn't write a text summary.
+        log.warning("[Bridge] Empty result. turns=%s tokens=%s",
+                     parsed.get("num_turns"), parsed.get("usage", {}).get("output_tokens"))
+        return "(Claude Code 已执行操作但未生成文字回复，请尝试更具体的提问)"
+
+    @staticmethod
+    def _extract_result(parsed: dict) -> str:
+        """Try multiple field names to find the actual text response."""
+        # 1. Direct top-level fields
+        for key in _RESULT_FIELDS:
+            val = parsed.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+            # Handle case where result is a list of message dicts
+            if isinstance(val, list):
+                texts = []
+                for item in val:
+                    if isinstance(item, str):
+                        texts.append(item)
+                    elif isinstance(item, dict):
+                        for sub_key in ("text", "content", "message", "value"):
+                            sv = item.get(sub_key)
+                            if isinstance(sv, str) and sv.strip():
+                                texts.append(sv.strip())
+                                break
+                if texts:
+                    return "\n".join(texts)
+
+        # 2. Nested under "data" or "choices" (common API patterns)
+        data = parsed.get("data")
+        if isinstance(data, dict):
+            for key in _RESULT_FIELDS:
+                val = data.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+
+        choices = parsed.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                msg = first.get("message") or first.get("delta") or first
+                if isinstance(msg, dict):
+                    for key in ("content", "text"):
+                        val = msg.get(key)
+                        if isinstance(val, str) and val.strip():
+                            return val.strip()
+
+        return ""
+
+    @staticmethod
+    def _collect_strings(obj: Any, out: list[str], skip_keys: set | None = None, depth: int = 0) -> None:
+        """Recursively collect non-trivial string values from a JSON structure."""
+        if depth > 5:
+            return
+        if isinstance(obj, str):
+            if len(obj.strip()) > 2:  # Skip trivial strings like "ok"
+                out.append(obj.strip())
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                if skip_keys and k in skip_keys:
+                    continue
+                ClaudeCodeBridge._collect_strings(v, out, skip_keys, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                ClaudeCodeBridge._collect_strings(item, out, skip_keys, depth + 1)
 
     def _build_cmd(self, prompt: str, session_id: str | None) -> list[str]:
         """Build ttadk CLI command list."""
@@ -136,7 +215,6 @@ class ClaudeCodeBridge:
 
         parts = [
             f"-p {safe(prompt)}",
-            f"--system-prompt {safe(self.system_prompt)}",
             "--output-format json",
         ]
         if session_id:
@@ -148,20 +226,50 @@ class ClaudeCodeBridge:
 
     @staticmethod
     def _extract_json(output: str) -> dict | None:
-        """Extract last valid JSON object from mixed CLI output."""
-        for line in reversed(output.splitlines()):
+        """Extract last valid JSON object from mixed CLI output.
+
+        Strategy:
+        1. Scan lines from bottom — fast path for single-line JSON
+        2. Try multi-line JSON — brace-matching from last '{' to matching '}'
+        3. Regex fallback — find nested JSON patterns
+        """
+        lines = output.splitlines()
+
+        # Pass 1: single-line JSON from bottom
+        for line in reversed(lines):
             stripped = line.strip()
-            if stripped.startswith("{"):
+            if stripped.startswith("{") and stripped.endswith("}"):
                 try:
                     return json.loads(stripped)
                 except json.JSONDecodeError:
                     continue
-        # Fallback: regex scan
+
+        # Pass 2: multi-line JSON — find last '{' and try to match '}'
+        last_brace = output.rfind("{")
+        while last_brace >= 0:
+            # Try progressively larger substrings
+            depth = 0
+            for i in range(last_brace, len(output)):
+                if output[i] == "{":
+                    depth += 1
+                elif output[i] == "}":
+                    depth -= 1
+                if depth == 0:
+                    candidate = output[last_brace : i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+            # Try previous '{'
+            last_brace = output.rfind("{", 0, last_brace)
+
+        # Pass 3: regex fallback
         for m in reversed(re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", output)):
             try:
                 return json.loads(m)
             except json.JSONDecodeError:
                 continue
+
         return None
 
 
