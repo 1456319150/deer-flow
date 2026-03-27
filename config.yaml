@@ -75,3 +75,23 @@ memory:
 checkpointer:
   type: sqlite
   connection_string: checkpoints.db
+
+channels:
+  langgraph_url: http://localhost:2024
+  # Gateway API URL for auxiliary queries like /models, /memory (default: http://localhost:8001)
+  gateway_url: http://localhost:8001
+
+  # Optional: default mobile/session settings for all IM channels
+  session:
+    assistant_id: lead_agent
+    config:
+      recursion_limit: 100
+    context:
+      thinking_enabled: true
+      is_plan_mode: false
+      subagent_enabled: false
+
+  feishu:
+    enabled: false
+    app_id: $FEISHU_APP_ID
+    app_secret: $FEISHU_APP_SECRET
