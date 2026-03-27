@@ -60,8 +60,11 @@ sandbox:
 skills:
   container_path: /mnt/skills
 
+# DISABLED: title generation wastes Claude Code calls ($0.065+ each)
+# and returns empty results due to Claude Code v2.1.83 bug.
+# Re-enable after adding a lightweight model or upgrading Claude Code.
 title:
-  enabled: true
+  enabled: false
   max_words: 6
   max_chars: 60
   model_name: null
@@ -78,10 +81,8 @@ checkpointer:
 
 channels:
   langgraph_url: http://localhost:2024
-  # Gateway API URL for auxiliary queries like /models, /memory (default: http://localhost:8001)
   gateway_url: http://localhost:8001
 
-  # Optional: default mobile/session settings for all IM channels
   session:
     assistant_id: lead_agent
     config:

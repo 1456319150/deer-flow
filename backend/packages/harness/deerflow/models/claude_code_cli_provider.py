@@ -13,6 +13,8 @@ Key design:
   - DeerFlow system prompt is SKIPPED — Claude Code gets a minimal system prompt
     to ensure it always produces a text response after tool use.
   - Multi-turn: when session_id exists, only the latest user message is sent.
+  - Uses --output-format stream-json to work around Claude Code v2.1.83 bug
+    where --output-format json returns empty result field.
 
 Config example (config.yaml):
     - name: claude-code
@@ -83,7 +85,7 @@ class ClaudeCodeCliModel(BaseChatModel):
         """Return the effective system prompt (config override or default)."""
         return self.system_prompt or DEFAULT_SYSTEM_PROMPT
 
-    # ─── Message conversion ───────────────────────────────────────────
+    # ─── Message conversion ────────────────────────────────────────────
 
     @classmethod
     def _normalize_content(cls, content: Any) -> str:
@@ -139,11 +141,86 @@ class ClaudeCodeCliModel(BaseChatModel):
         logger.warning("[CCM] No HumanMessage found, returning empty")
         return ""
 
-    # ─── JSON extraction (from claude_chain.py) ──────────────────────
+    # ─── Stream-JSON parsing ──────────────────────────────────────────
+
+    @staticmethod
+    def _parse_stream_json(raw_output: str) -> dict:
+        """Parse stream-json output from Claude Code CLI.
+
+        stream-json format emits one JSON object per line. We look for:
+        1. "assistant" messages with content[].text → aggregate as result text
+        2. "result" event → extract metadata (session_id, usage, cost)
+
+        This works around the v2.1.83 bug where --output-format json
+        returns empty result field despite generating output tokens.
+
+        Returns a dict compatible with the old json format:
+            {"result": "...", "session_id": "...", "usage": {...}, ...}
+        """
+        assistant_texts = []
+        result_event = {}
+
+        for line in raw_output.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = event.get("type")
+
+            if event_type == "assistant":
+                # Extract text from assistant message content blocks
+                message = event.get("message", {})
+                content_blocks = message.get("content", [])
+                for block in content_blocks:
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        if text:
+                            assistant_texts.append(text)
+                logger.warning(
+                    "[CCM] stream-json: assistant event, extracted %d text blocks",
+                    len(content_blocks)
+                )
+
+            elif event_type == "result":
+                result_event = event
+                # Also check if result has non-empty text (fixed versions)
+                result_text = event.get("result", "")
+                if result_text:
+                    # If the result field is non-empty, prefer it
+                    # (means we're running a fixed Claude Code version)
+                    assistant_texts = [result_text]
+                logger.warning(
+                    "[CCM] stream-json: result event, result=%d chars, session_id=%s",
+                    len(result_text), event.get("session_id", "N/A")
+                )
+
+        # Build the combined response
+        combined_text = "\n\n".join(assistant_texts) if assistant_texts else ""
+
+        return {
+            "result": combined_text,
+            "session_id": result_event.get("session_id"),
+            "conversation_id": result_event.get("conversation_id"),
+            "uuid": result_event.get("uuid"),
+            "usage": result_event.get("usage", {}),
+            "total_cost_usd": result_event.get("total_cost_usd"),
+            "stop_reason": result_event.get("stop_reason"),
+            "output_tokens": result_event.get("output_tokens", 0),
+        }
+
+    # ─── JSON extraction (legacy fallback) ────────────────────────────
 
     @staticmethod
     def _extract_json(output: str) -> dict | None:
-        """Extract the last valid JSON object from mixed CLI output."""
+        """Extract the last valid JSON object from mixed CLI output.
+
+        Used as fallback when stream-json parsing yields no result.
+        """
         # Strategy 1: scan lines from bottom
         for line in reversed(output.splitlines()):
             line = line.strip()
@@ -163,7 +240,7 @@ class ClaudeCodeCliModel(BaseChatModel):
 
         return None
 
-    # ─── CLI execution ───────────────────────────────────────────────
+    # ─── CLI execution ────────────────────────────────────────────────
 
     def _build_cli_args(self, prompt: str) -> list[str]:
         """Build the ttadk CLI command as a list of arguments."""
@@ -174,7 +251,11 @@ class ClaudeCodeCliModel(BaseChatModel):
         sys_prompt = self._effective_system_prompt.replace("\r\n", "\\n").replace("\n", "\\n")
         safe_sys = "'" + sys_prompt.replace("'", "'\"'\"'") + "'"
 
-        a_parts = [f"-p {safe_prompt}", f"--system-prompt {safe_sys}", "--output-format json"]
+        # Use stream-json instead of json to work around Claude Code v2.1.83 bug
+        # where --output-format json returns empty result field.
+        # stream-json emits per-event JSON lines, including assistant messages
+        # with the actual text content.
+        a_parts = [f"-p {safe_prompt}", f"--system-prompt {safe_sys}", "--output-format stream-json"]
 
         if self._session_id:
             a_parts.insert(0, f"--resume {self._session_id}")
@@ -192,6 +273,7 @@ class ClaudeCodeCliModel(BaseChatModel):
             "  ttadk_cmd: %s\n"
             "  target: %s, model: %s\n"
             "  session_id: %s\n"
+            "  output_format: stream-json\n"
             "  system_prompt (%d chars): %r\n"
             "  prompt (%d chars): %r\n"
             "  -a arg (%d chars): %r",
@@ -204,8 +286,59 @@ class ClaudeCodeCliModel(BaseChatModel):
 
         return cmd
 
+    def _process_raw_output(self, raw_output: str, exit_code: int) -> dict:
+        """Process raw CLI output: try stream-json first, fall back to legacy JSON.
+
+        Returns parsed response dict with at minimum: result, session_id, usage.
+        """
+        # Check for auth redirects first
+        auth_patterns = [
+            r"https?://\S*auth\S*",
+            r"https?://\S*login\S*",
+            r"https?://\S*oauth\S*",
+        ]
+        for pattern in auth_patterns:
+            urls = re.findall(pattern, raw_output)
+            if urls:
+                logger.error("[CCM] AUTH REQUIRED: %s", urls[0])
+                raise RuntimeError(
+                    f"Claude Code requires authentication. "
+                    f"Please open in browser: {urls[0]}"
+                )
+
+        # Primary: parse as stream-json
+        parsed = self._parse_stream_json(raw_output)
+        if parsed["result"]:
+            logger.warning(
+                "[CCM] stream-json parsed OK: result=%d chars, session_id=%s",
+                len(parsed["result"]), parsed.get("session_id")
+            )
+            return parsed
+
+        # Fallback 1: try legacy single-JSON extraction
+        logger.warning("[CCM] stream-json yielded empty result, trying legacy JSON extraction")
+        legacy = self._extract_json(raw_output)
+        if legacy and legacy.get("result"):
+            logger.warning(
+                "[CCM] Legacy JSON OK: result=%d chars, session_id=%s",
+                len(legacy["result"]), legacy.get("session_id")
+            )
+            return legacy
+
+        # Fallback 2: use raw tail text as last resort
+        logger.warning("[CCM] All JSON parsing failed, using raw tail text")
+        tail_lines = raw_output.strip().splitlines()[-20:]
+        # Filter out JSON lines (they're events, not user-facing text)
+        text_lines = [l for l in tail_lines if not l.strip().startswith("{")]
+        tail = "\n".join(text_lines).strip()
+        if not tail:
+            # If everything was JSON, just use whatever we have
+            tail = "\n".join(tail_lines).strip()
+
+        return {"result": tail or "(Claude Code returned no text)", "session_id": None, "usage": {}}
+
     def _call_cli_sync(self, prompt: str) -> dict:
-        """Execute ttadk code synchronously and return parsed JSON."""
+        """Execute ttadk code synchronously and return parsed response."""
         cmd = self._build_cli_args(prompt)
 
         try:
@@ -236,42 +369,13 @@ class ClaudeCodeCliModel(BaseChatModel):
             "[CCM] CLI finished (exit_code=%d, output=%d chars):\n"
             "--- RAW OUTPUT START ---\n%s\n--- RAW OUTPUT END ---",
             exit_code, len(raw_output),
-            raw_output[:2000] + ("...[truncated]" if len(raw_output) > 2000 else "")
+            raw_output[:3000] + ("...[truncated]" if len(raw_output) > 3000 else "")
         )
 
-        auth_patterns = [
-            r"https?://\S*auth\S*",
-            r"https?://\S*login\S*",
-            r"https?://\S*oauth\S*",
-        ]
-        for pattern in auth_patterns:
-            urls = re.findall(pattern, raw_output)
-            if urls:
-                logger.error("[CCM] AUTH REQUIRED: %s", urls[0])
-                raise RuntimeError(
-                    f"Claude Code requires authentication. "
-                    f"Please open in browser: {urls[0]}"
-                )
-
-        parsed = self._extract_json(raw_output)
-        if parsed is None:
-            logger.warning("[CCM] JSON parse FAILED, falling back to raw tail text")
-            tail = "\n".join(raw_output.strip().splitlines()[-20:])
-            return {"result": tail, "session_id": None, "usage": {}}
-
-        result_preview = str(parsed.get("result", ""))[:300]
-        logger.warning(
-            "[CCM] Parsed JSON OK: session_id=%s, result(%d chars)=%r, keys=%s",
-            parsed.get("session_id") or parsed.get("conversation_id") or parsed.get("uuid"),
-            len(str(parsed.get("result", ""))),
-            result_preview,
-            list(parsed.keys())
-        )
-
-        return parsed
+        return self._process_raw_output(raw_output, exit_code)
 
     async def _call_cli_async(self, prompt: str) -> dict:
-        """Execute ttadk code asynchronously."""
+        """Execute ttadk code asynchronously and return parsed response."""
         cmd = self._build_cli_args(prompt)
 
         try:
@@ -304,44 +408,15 @@ class ClaudeCodeCliModel(BaseChatModel):
             "[CCM] async CLI finished (exit_code=%d, output=%d chars):\n"
             "--- RAW OUTPUT START ---\n%s\n--- RAW OUTPUT END ---",
             exit_code, len(raw_output),
-            raw_output[:2000] + ("...[truncated]" if len(raw_output) > 2000 else "")
+            raw_output[:3000] + ("...[truncated]" if len(raw_output) > 3000 else "")
         )
 
-        auth_patterns = [
-            r"https?://\S*auth\S*",
-            r"https?://\S*login\S*",
-            r"https?://\S*oauth\S*",
-        ]
-        for pattern in auth_patterns:
-            urls = re.findall(pattern, raw_output)
-            if urls:
-                logger.error("[CCM] AUTH REQUIRED: %s", urls[0])
-                raise RuntimeError(
-                    f"Claude Code requires authentication. "
-                    f"Please open in browser: {urls[0]}"
-                )
+        return self._process_raw_output(raw_output, exit_code)
 
-        parsed = self._extract_json(raw_output)
-        if parsed is None:
-            logger.warning("[CCM] JSON parse FAILED, falling back to raw tail text")
-            tail = "\n".join(raw_output.strip().splitlines()[-20:])
-            return {"result": tail, "session_id": None, "usage": {}}
-
-        result_preview = str(parsed.get("result", ""))[:300]
-        logger.warning(
-            "[CCM] Parsed JSON OK: session_id=%s, result(%d chars)=%r, keys=%s",
-            parsed.get("session_id") or parsed.get("conversation_id") or parsed.get("uuid"),
-            len(str(parsed.get("result", ""))),
-            result_preview,
-            list(parsed.keys())
-        )
-
-        return parsed
-
-    # ─── Response parsing ────────────────────────────────────────────
+    # ─── Response parsing ─────────────────────────────────────────────
 
     def _parse_response(self, response: dict) -> ChatResult:
-        """Convert ttadk JSON response to LangChain ChatResult."""
+        """Convert parsed response to LangChain ChatResult."""
         old_session_id = self._session_id
 
         for key in ("session_id", "conversation_id", "uuid"):
@@ -384,7 +459,7 @@ class ClaudeCodeCliModel(BaseChatModel):
             },
         )
 
-    # ─── BaseChatModel interface ────────────────────────────────────
+    # ─── BaseChatModel interface ──────────────────────────────────────
 
     def _generate(
         self,
