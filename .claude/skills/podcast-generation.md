@@ -1,1 +1,0 @@
-../../skills/public/podcast-generation/SKILL.md

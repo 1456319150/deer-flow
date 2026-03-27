@@ -1,1 +1,0 @@
-../../skills/public/claude-to-deerflow/SKILL.md

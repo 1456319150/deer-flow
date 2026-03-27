@@ -1,1 +1,0 @@
-../../skills/public/image-generation/SKILL.md

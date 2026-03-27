@@ -1,1 +1,0 @@
-../../skills/public/chart-visualization/SKILL.md

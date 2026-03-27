@@ -1,1 +1,0 @@
-../../skills/public/consulting-analysis/SKILL.md

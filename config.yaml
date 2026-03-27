@@ -1,98 +1,17 @@
-# DeerFlow config — Claude Code via ttadk CLI as primary model
-config_version: 3
+# Feishu → Claude Code Gateway
+# Env vars: FEISHU_APP_ID, FEISHU_APP_SECRET
 
-log_level: info
+feishu:
+  app_id: $FEISHU_APP_ID
+  app_secret: $FEISHU_APP_SECRET
 
-token_usage:
-  enabled: true
-
-models:
-  - name: claude-code
-    display_name: Claude Code (ttadk)
-    description: Claude Code agent via ttadk CLI — full agent loop with built-in tools
-    use: deerflow.models.claude_code_cli_provider:ClaudeCodeCliModel
-    model: gpt-5.4
-    target: claude
-    timeout: 600
-    allowed_tools: "Bash,Read,Write,Edit"
-
-tool_groups:
-  - name: web
-  - name: file:read
-  - name: file:write
-  - name: bash
-
-tools:
-  - name: web_search
-    group: web
-    use: deerflow.community.ddg_search.tools:web_search_tool
-    max_results: 5
-  - name: web_fetch
-    group: web
-    use: deerflow.community.jina_ai.tools:web_fetch_tool
-    timeout: 10
-  - name: image_search
-    group: web
-    use: deerflow.community.image_search.tools:image_search_tool
-    max_results: 5
-  - name: ls
-    group: file:read
-    use: deerflow.sandbox.tools:ls_tool
-  - name: read_file
-    group: file:read
-    use: deerflow.sandbox.tools:read_file_tool
-  - name: write_file
-    group: file:write
-    use: deerflow.sandbox.tools:write_file_tool
-  - name: str_replace
-    group: file:write
-    use: deerflow.sandbox.tools:str_replace_tool
-  - name: bash
-    group: bash
-    use: deerflow.sandbox.tools:bash_tool
-
-tool_search:
-  enabled: false
-
-sandbox:
-  use: deerflow.sandbox.local:LocalSandboxProvider
-
-skills:
-  container_path: /mnt/skills
-
-# DISABLED: title generation wastes Claude Code calls ($0.065+ each)
-# and returns empty results due to Claude Code v2.1.83 bug.
-# Re-enable after adding a lightweight model or upgrading Claude Code.
-title:
-  enabled: false
-  max_words: 6
-  max_chars: 60
-  model_name: null
-
-summarization:
-  enabled: false
-
-memory:
-  enabled: false
-
-checkpointer:
-  type: sqlite
-  connection_string: checkpoints.db
-
-channels:
-  langgraph_url: http://localhost:2024
-  gateway_url: http://localhost:8001
-
-  session:
-    assistant_id: lead_agent
-    config:
-      recursion_limit: 100
-    context:
-      thinking_enabled: true
-      is_plan_mode: false
-      subagent_enabled: false
-
-  feishu:
-    enabled: false
-    app_id: $FEISHU_APP_ID
-    app_secret: $FEISHU_APP_SECRET
+claude:
+  ttadk_cmd: ttadk           # or full path: /usr/local/bin/ttadk
+  model: gpt-5.4
+  target: claude
+  timeout: 600               # seconds
+  allowed_tools: "Bash,Read,Write,Edit"
+  system_prompt: >-
+    You are a helpful AI assistant.
+    Always respond in the user's language.
+    After using tools, summarize findings in text.

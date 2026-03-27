@@ -1,1 +1,0 @@
-../../skills/public/web-design-guidelines/SKILL.md
