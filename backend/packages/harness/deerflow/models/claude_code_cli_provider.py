@@ -174,16 +174,12 @@ class ClaudeCodeCliModel(BaseChatModel):
         try:
             proc = subprocess.Popen(
                 cmd,
-                stdin=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            # Auto-answer interactive prompts (version update, etc.)
-            stdout, _ = proc.communicate(
-                input="Y\nY\nY\nYes\nYes\n",
-                timeout=self.timeout,
-            )
+            stdout, _ = proc.communicate(timeout=self.timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
@@ -226,12 +222,12 @@ class ClaudeCodeCliModel(BaseChatModel):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdin=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
             stdout_bytes, _ = await asyncio.wait_for(
-                proc.communicate(input=b"Y\nY\nY\nYes\nYes\n"),
+                proc.communicate(),
                 timeout=self.timeout,
             )
         except asyncio.TimeoutError:
