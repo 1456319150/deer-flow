@@ -1,3 +1,6 @@
+import logging
+
+logger = logging.getLogger("deerflow.agents.prompt")
 from datetime import datetime
 
 from deerflow.config.agents_config import load_agent_soul
@@ -383,6 +386,10 @@ def get_skills_prompt_section(available_skills: set[str] | None = None) -> str:
         container_base_path = config.skills.container_path
     except Exception:
         container_base_path = "/mnt/skills"
+
+    logger.info("[skills_prompt] loaded %d enabled skills, container_base_path=%s", len(skills), container_base_path)
+    for s in skills:
+        logger.info("[skills_prompt]   skill: name=%s, dir=%s, container_file=%s", s.name, s.skill_dir, s.get_container_file_path(container_base_path))
 
     if not skills:
         return ""

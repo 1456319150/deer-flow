@@ -13,7 +13,10 @@ from deerflow.sandbox.exceptions import (
     SandboxRuntimeError,
 )
 from deerflow.sandbox.sandbox import Sandbox
+import logging
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
+
+logger = logging.getLogger("deerflow.sandbox.tools")
 
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![:\w])/(?:[^\s\"'`;&|<>()]+)")
 _LOCAL_BASH_SYSTEM_PATH_PREFIXES = (
@@ -94,7 +97,9 @@ def _resolve_skills_path(path: str) -> str:
     """
     skills_container = _get_skills_container_path()
     skills_host = _get_skills_host_path()
+    logger.info("[_resolve_skills_path] container=%s, host=%s, requested=%s", skills_container, skills_host, path)
     if skills_host is None:
+        logger.error("[_resolve_skills_path] SKILLS HOST IS NONE for path=%s", path)
         raise FileNotFoundError(f"Skills directory not available for path: {path}")
 
     if path == skills_container:
@@ -741,11 +746,14 @@ def ls_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, path:
         sandbox = ensure_sandbox_initialized(runtime)
         ensure_thread_directories_exist(runtime)
         requested_path = path
+        logger.info("[read_file] called: path=%s, description=%s", path, description)
         if is_local_sandbox(runtime):
             thread_data = get_thread_data(runtime)
             validate_local_tool_path(path, thread_data, read_only=True)
             if _is_skills_path(path):
+                resolved_before = path
                 path = _resolve_skills_path(path)
+                logger.info("[read_file] skills path resolved: %s -> %s (exists=%s)", resolved_before, path, __import__('os').path.exists(path))
             elif _is_acp_workspace_path(path):
                 path = _resolve_acp_workspace_path(path, _extract_thread_id_from_thread_data(thread_data))
             else:
@@ -784,16 +792,20 @@ def read_file_tool(
         sandbox = ensure_sandbox_initialized(runtime)
         ensure_thread_directories_exist(runtime)
         requested_path = path
+        logger.info("[read_file] called: path=%s, description=%s", path, description)
         if is_local_sandbox(runtime):
             thread_data = get_thread_data(runtime)
             validate_local_tool_path(path, thread_data, read_only=True)
             if _is_skills_path(path):
+                resolved_before = path
                 path = _resolve_skills_path(path)
+                logger.info("[read_file] skills path resolved: %s -> %s (exists=%s)", resolved_before, path, __import__('os').path.exists(path))
             elif _is_acp_workspace_path(path):
                 path = _resolve_acp_workspace_path(path, _extract_thread_id_from_thread_data(thread_data))
             else:
                 path = _resolve_and_validate_user_data_path(path, thread_data)
         content = sandbox.read_file(path)
+        logger.info("[read_file] success: requested=%s, content_length=%d", requested_path, len(content) if content else 0)
         if not content:
             return "(empty)"
         if start_line is not None and end_line is not None:
@@ -802,8 +814,10 @@ def read_file_tool(
     except SandboxError as e:
         return f"Error: {e}"
     except FileNotFoundError:
+        logger.error("[read_file] FILE NOT FOUND: requested=%s, resolved=%s", requested_path, path)
         return f"Error: File not found: {requested_path}"
-    except PermissionError:
+    except PermissionError as e:
+        logger.error("[read_file] PERMISSION DENIED: requested=%s, resolved=%s, error=%s", requested_path, path, e)
         return f"Error: Permission denied reading file: {requested_path}"
     except IsADirectoryError:
         return f"Error: Path is a directory, not a file: {requested_path}"
