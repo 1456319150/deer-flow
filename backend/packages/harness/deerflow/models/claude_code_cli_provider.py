@@ -10,7 +10,8 @@ Key design:
   - bind_tools() is a no-op — DeerFlow's tools are NOT forwarded to Claude Code
   - --allowedTools controls which Claude Code built-in tools are available
   - Session continuity via --resume (optional, keyed by DeerFlow thread_id)
-  - DeerFlow system prompt is SKIPPED — Claude Code has its own system prompt + skills.
+  - DeerFlow system prompt is SKIPPED — Claude Code gets a minimal system prompt
+    to ensure it always produces a text response after tool use.
   - Multi-turn: when session_id exists, only the latest user message is sent.
 
 Config example (config.yaml):
@@ -21,6 +22,7 @@ Config example (config.yaml):
       target: claude
       timeout: 600
       allowed_tools: "Bash,Read,Write,Edit"
+      system_prompt: "Always reply in the user's language. After using tools, summarize findings in text."
 """
 
 import asyncio
@@ -43,6 +45,16 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 logger = logging.getLogger(__name__)
 
+# Minimal system prompt for Claude Code.
+# DeerFlow's 18KB system prompt is skipped (wrong tools/paths/instructions).
+# This just ensures Claude Code always produces a text response.
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful AI coding assistant. "
+    "Always respond with a clear text answer in the user's language. "
+    "When you use tools to gather information, summarize your findings in your final response. "
+    "Never end with just a tool call — always provide a text conclusion."
+)
+
 
 class ClaudeCodeCliModel(BaseChatModel):
     """LangChain chat model that delegates to Claude Code via ttadk CLI.
@@ -55,6 +67,7 @@ class ClaudeCodeCliModel(BaseChatModel):
     target: str = "claude"
     timeout: int = 600
     allowed_tools: str | None = None
+    system_prompt: str | None = None
     ttadk_cmd: str = "ttadk"
     retry_max_attempts: int = 3
     _session_id: str | None = None
@@ -64,6 +77,11 @@ class ClaudeCodeCliModel(BaseChatModel):
     @property
     def _llm_type(self) -> str:
         return "claude-code-cli"
+
+    @property
+    def _effective_system_prompt(self) -> str:
+        """Return the effective system prompt (config override or default)."""
+        return self.system_prompt or DEFAULT_SYSTEM_PROMPT
 
     # ─── Message conversion ───────────────────────────────────────────
 
@@ -90,11 +108,15 @@ class ClaudeCodeCliModel(BaseChatModel):
         return str(content) if content else ""
 
     def _flatten_messages(self, messages: list[BaseMessage]) -> str:
-        """Convert LangChain message list into a single prompt string.
+        """Extract only the latest user message.
 
-        Two modes depending on session state:
-        1. Resuming (session_id exists): Only send the latest HumanMessage.
-        2. First turn (no session_id): Send all non-system messages.
+        DeerFlow's system prompt is always skipped — we use our own minimal
+        system prompt via --system-prompt flag instead.
+
+        Always extracts only the last HumanMessage because:
+        1. Each ttadk call may create a new model instance (session_id lost)
+        2. AI response content in history causes CLI arg escaping issues
+        3. If --resume works, Claude Code already has context
         """
         # Log incoming messages for debugging
         msg_summary = []
@@ -106,38 +128,16 @@ class ClaudeCodeCliModel(BaseChatModel):
             len(messages), self._session_id, "\n  ".join(msg_summary)
         )
 
-        # Resuming: Claude Code already has context, only send new input
-        if self._session_id:
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    content = self._normalize_content(msg.content)
-                    if content:
-                        logger.warning("[CCM] Resume mode: sending only last HumanMessage (%d chars): %r", len(content), content[:200])
-                        return content
-            logger.warning("[CCM] Resume mode: no HumanMessage found, returning empty")
-            return ""
+        # Always extract only the last HumanMessage
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                content = self._normalize_content(msg.content)
+                if content:
+                    logger.warning("[CCM] Extracted last HumanMessage (%d chars): %r", len(content), content[:200])
+                    return content
 
-        # First turn: send all non-system messages
-        conversation_parts: list[str] = []
-
-        for msg in messages:
-            content = self._normalize_content(msg.content)
-            if not content:
-                continue
-
-            if isinstance(msg, SystemMessage):
-                logger.warning("[CCM] Skipping SystemMessage (%d chars)", len(content))
-                continue
-            elif isinstance(msg, HumanMessage):
-                conversation_parts.append(content)
-            elif isinstance(msg, AIMessage):
-                conversation_parts.append(f"Assistant: {content}")
-            elif isinstance(msg, ToolMessage):
-                conversation_parts.append(f"Tool result: {content}")
-
-        result = "\n\n".join(conversation_parts) if conversation_parts else ""
-        logger.warning("[CCM] First turn: flattened to %d chars: %r", len(result), result[:200])
-        return result
+        logger.warning("[CCM] No HumanMessage found, returning empty")
+        return ""
 
     # ─── JSON extraction (from claude_chain.py) ──────────────────────
 
@@ -169,7 +169,12 @@ class ClaudeCodeCliModel(BaseChatModel):
         """Build the ttadk CLI command as a list of arguments."""
         clean_prompt = prompt.replace("\r\n", "\\n").replace("\n", "\\n")
         safe_prompt = "'" + clean_prompt.replace("'", "'\"'\"'") + "'"
-        a_parts = [f"-p {safe_prompt}", "--output-format json"]
+
+        # System prompt — short enough to safely pass via CLI
+        sys_prompt = self._effective_system_prompt.replace("\r\n", "\\n").replace("\n", "\\n")
+        safe_sys = "'" + sys_prompt.replace("'", "'\"'\"'") + "'"
+
+        a_parts = [f"-p {safe_prompt}", f"--system-prompt {safe_sys}", "--output-format json"]
 
         if self._session_id:
             a_parts.insert(0, f"--resume {self._session_id}")
@@ -180,17 +185,19 @@ class ClaudeCodeCliModel(BaseChatModel):
         a_arg = " ".join(a_parts)
         cmd = [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", a_arg]
 
-        # Log the full command for debugging (mask prompt if too long)
+        # Log the full command for debugging
         prompt_display = prompt[:300] + "..." if len(prompt) > 300 else prompt
         logger.warning(
             "[CCM] CLI command built:\n"
             "  ttadk_cmd: %s\n"
             "  target: %s, model: %s\n"
             "  session_id: %s\n"
+            "  system_prompt (%d chars): %r\n"
             "  prompt (%d chars): %r\n"
             "  -a arg (%d chars): %r",
             self.ttadk_cmd, self.target, self.model,
             self._session_id,
+            len(self._effective_system_prompt), self._effective_system_prompt[:200],
             len(prompt), prompt_display,
             len(a_arg), a_arg[:500] + ("..." if len(a_arg) > 500 else "")
         )
@@ -225,7 +232,6 @@ class ClaudeCodeCliModel(BaseChatModel):
         raw_output = stdout or ""
         exit_code = proc.returncode
 
-        # Log raw output
         logger.warning(
             "[CCM] CLI finished (exit_code=%d, output=%d chars):\n"
             "--- RAW OUTPUT START ---\n%s\n--- RAW OUTPUT END ---",
@@ -233,7 +239,6 @@ class ClaudeCodeCliModel(BaseChatModel):
             raw_output[:2000] + ("...[truncated]" if len(raw_output) > 2000 else "")
         )
 
-        # Detect auth URLs
         auth_patterns = [
             r"https?://\S*auth\S*",
             r"https?://\S*login\S*",
@@ -254,7 +259,6 @@ class ClaudeCodeCliModel(BaseChatModel):
             tail = "\n".join(raw_output.strip().splitlines()[-20:])
             return {"result": tail, "session_id": None, "usage": {}}
 
-        # Log parsed result
         result_preview = str(parsed.get("result", ""))[:300]
         logger.warning(
             "[CCM] Parsed JSON OK: session_id=%s, result(%d chars)=%r, keys=%s",
@@ -296,7 +300,6 @@ class ClaudeCodeCliModel(BaseChatModel):
         raw_output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
         exit_code = proc.returncode
 
-        # Log raw output
         logger.warning(
             "[CCM] async CLI finished (exit_code=%d, output=%d chars):\n"
             "--- RAW OUTPUT START ---\n%s\n--- RAW OUTPUT END ---",
