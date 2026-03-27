@@ -11,11 +11,7 @@ Key design:
   - --allowedTools controls which Claude Code built-in tools are available
   - Session continuity via --resume (optional, keyed by DeerFlow thread_id)
   - DeerFlow system prompt is SKIPPED — Claude Code has its own system prompt + skills.
-    Passing DeerFlow's 9KB prompt through CLI args causes escaping/size issues and
-    references tools that don't exist in Claude Code's environment.
   - Multi-turn: when session_id exists, only the latest user message is sent.
-    Claude Code maintains conversation context via --resume, so re-sending
-    history is redundant and causes escaping issues with AI response content.
 
 Config example (config.yaml):
     - name: claude-code
@@ -97,22 +93,28 @@ class ClaudeCodeCliModel(BaseChatModel):
         """Convert LangChain message list into a single prompt string.
 
         Two modes depending on session state:
-
         1. Resuming (session_id exists): Only send the latest HumanMessage.
-           Claude Code maintains full conversation context via --resume,
-           so re-sending history is redundant and causes CLI arg escaping
-           issues when AI responses contain special characters.
-
         2. First turn (no session_id): Send all non-system messages.
-           System prompt is always skipped — Claude Code has its own.
         """
+        # Log incoming messages for debugging
+        msg_summary = []
+        for msg in messages:
+            content_preview = self._normalize_content(msg.content)[:80]
+            msg_summary.append(f"{type(msg).__name__}({len(self._normalize_content(msg.content))}chars): {content_preview!r}")
+        logger.warning(
+            "[CCM] _flatten_messages called with %d messages (session_id=%s):\n  %s",
+            len(messages), self._session_id, "\n  ".join(msg_summary)
+        )
+
         # Resuming: Claude Code already has context, only send new input
         if self._session_id:
             for msg in reversed(messages):
                 if isinstance(msg, HumanMessage):
                     content = self._normalize_content(msg.content)
                     if content:
+                        logger.warning("[CCM] Resume mode: sending only last HumanMessage (%d chars): %r", len(content), content[:200])
                         return content
+            logger.warning("[CCM] Resume mode: no HumanMessage found, returning empty")
             return ""
 
         # First turn: send all non-system messages
@@ -124,7 +126,7 @@ class ClaudeCodeCliModel(BaseChatModel):
                 continue
 
             if isinstance(msg, SystemMessage):
-                # Skip: Claude Code has its own system prompt + skills.
+                logger.warning("[CCM] Skipping SystemMessage (%d chars)", len(content))
                 continue
             elif isinstance(msg, HumanMessage):
                 conversation_parts.append(content)
@@ -133,7 +135,9 @@ class ClaudeCodeCliModel(BaseChatModel):
             elif isinstance(msg, ToolMessage):
                 conversation_parts.append(f"Tool result: {content}")
 
-        return "\n\n".join(conversation_parts) if conversation_parts else ""
+        result = "\n\n".join(conversation_parts) if conversation_parts else ""
+        logger.warning("[CCM] First turn: flattened to %d chars: %r", len(result), result[:200])
+        return result
 
     # ─── JSON extraction (from claude_chain.py) ──────────────────────
 
@@ -163,10 +167,7 @@ class ClaudeCodeCliModel(BaseChatModel):
 
     def _build_cli_args(self, prompt: str) -> list[str]:
         """Build the ttadk CLI command as a list of arguments."""
-        # Escape single quotes for shell-like arg parsing (ttadk parses -a value)
-        # Collapse newlines to literal \n to avoid ttadk -a arg parsing breakage
         clean_prompt = prompt.replace("\r\n", "\\n").replace("\n", "\\n")
-        # Escape single quotes for shell-like arg parsing in ttadk
         safe_prompt = "'" + clean_prompt.replace("'", "'\"'\"'") + "'"
         a_parts = [f"-p {safe_prompt}", "--output-format json"]
 
@@ -177,12 +178,28 @@ class ClaudeCodeCliModel(BaseChatModel):
             a_parts.append(f"--allowedTools {self.allowed_tools}")
 
         a_arg = " ".join(a_parts)
-        return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", a_arg]
+        cmd = [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", a_arg]
+
+        # Log the full command for debugging (mask prompt if too long)
+        prompt_display = prompt[:300] + "..." if len(prompt) > 300 else prompt
+        logger.warning(
+            "[CCM] CLI command built:\n"
+            "  ttadk_cmd: %s\n"
+            "  target: %s, model: %s\n"
+            "  session_id: %s\n"
+            "  prompt (%d chars): %r\n"
+            "  -a arg (%d chars): %r",
+            self.ttadk_cmd, self.target, self.model,
+            self._session_id,
+            len(prompt), prompt_display,
+            len(a_arg), a_arg[:500] + ("..." if len(a_arg) > 500 else "")
+        )
+
+        return cmd
 
     def _call_cli_sync(self, prompt: str) -> dict:
         """Execute ttadk code synchronously and return parsed JSON."""
         cmd = self._build_cli_args(prompt)
-        logger.info(f"ClaudeCodeCli: calling ttadk (model={self.model}, target={self.target}, resume={bool(self._session_id)})")
 
         try:
             proc = subprocess.Popen(
@@ -196,14 +213,25 @@ class ClaudeCodeCliModel(BaseChatModel):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
+            logger.error("[CCM] TIMEOUT after %ds", self.timeout)
             raise RuntimeError(f"Claude Code CLI timed out after {self.timeout}s")
         except FileNotFoundError:
+            logger.error("[CCM] COMMAND NOT FOUND: %s", self.ttadk_cmd)
             raise RuntimeError(
                 f"Command not found: {self.ttadk_cmd}. "
                 "Ensure ttadk is installed and in PATH."
             )
 
         raw_output = stdout or ""
+        exit_code = proc.returncode
+
+        # Log raw output
+        logger.warning(
+            "[CCM] CLI finished (exit_code=%d, output=%d chars):\n"
+            "--- RAW OUTPUT START ---\n%s\n--- RAW OUTPUT END ---",
+            exit_code, len(raw_output),
+            raw_output[:2000] + ("...[truncated]" if len(raw_output) > 2000 else "")
+        )
 
         # Detect auth URLs
         auth_patterns = [
@@ -214,6 +242,7 @@ class ClaudeCodeCliModel(BaseChatModel):
         for pattern in auth_patterns:
             urls = re.findall(pattern, raw_output)
             if urls:
+                logger.error("[CCM] AUTH REQUIRED: %s", urls[0])
                 raise RuntimeError(
                     f"Claude Code requires authentication. "
                     f"Please open in browser: {urls[0]}"
@@ -221,16 +250,25 @@ class ClaudeCodeCliModel(BaseChatModel):
 
         parsed = self._extract_json(raw_output)
         if parsed is None:
-            logger.warning("Failed to parse JSON from CLI output, using raw text")
+            logger.warning("[CCM] JSON parse FAILED, falling back to raw tail text")
             tail = "\n".join(raw_output.strip().splitlines()[-20:])
             return {"result": tail, "session_id": None, "usage": {}}
+
+        # Log parsed result
+        result_preview = str(parsed.get("result", ""))[:300]
+        logger.warning(
+            "[CCM] Parsed JSON OK: session_id=%s, result(%d chars)=%r, keys=%s",
+            parsed.get("session_id") or parsed.get("conversation_id") or parsed.get("uuid"),
+            len(str(parsed.get("result", ""))),
+            result_preview,
+            list(parsed.keys())
+        )
 
         return parsed
 
     async def _call_cli_async(self, prompt: str) -> dict:
         """Execute ttadk code asynchronously."""
         cmd = self._build_cli_args(prompt)
-        logger.info(f"ClaudeCodeCli: async calling ttadk (model={self.model}, target={self.target}, resume={bool(self._session_id)})")
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -246,14 +284,25 @@ class ClaudeCodeCliModel(BaseChatModel):
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
+            logger.error("[CCM] ASYNC TIMEOUT after %ds", self.timeout)
             raise RuntimeError(f"Claude Code CLI timed out after {self.timeout}s")
         except FileNotFoundError:
+            logger.error("[CCM] COMMAND NOT FOUND: %s", self.ttadk_cmd)
             raise RuntimeError(
                 f"Command not found: {self.ttadk_cmd}. "
                 "Ensure ttadk is installed and in PATH."
             )
 
         raw_output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+        exit_code = proc.returncode
+
+        # Log raw output
+        logger.warning(
+            "[CCM] async CLI finished (exit_code=%d, output=%d chars):\n"
+            "--- RAW OUTPUT START ---\n%s\n--- RAW OUTPUT END ---",
+            exit_code, len(raw_output),
+            raw_output[:2000] + ("...[truncated]" if len(raw_output) > 2000 else "")
+        )
 
         auth_patterns = [
             r"https?://\S*auth\S*",
@@ -263,6 +312,7 @@ class ClaudeCodeCliModel(BaseChatModel):
         for pattern in auth_patterns:
             urls = re.findall(pattern, raw_output)
             if urls:
+                logger.error("[CCM] AUTH REQUIRED: %s", urls[0])
                 raise RuntimeError(
                     f"Claude Code requires authentication. "
                     f"Please open in browser: {urls[0]}"
@@ -270,9 +320,18 @@ class ClaudeCodeCliModel(BaseChatModel):
 
         parsed = self._extract_json(raw_output)
         if parsed is None:
-            logger.warning("Failed to parse JSON from CLI output, using raw text")
+            logger.warning("[CCM] JSON parse FAILED, falling back to raw tail text")
             tail = "\n".join(raw_output.strip().splitlines()[-20:])
             return {"result": tail, "session_id": None, "usage": {}}
+
+        result_preview = str(parsed.get("result", ""))[:300]
+        logger.warning(
+            "[CCM] Parsed JSON OK: session_id=%s, result(%d chars)=%r, keys=%s",
+            parsed.get("session_id") or parsed.get("conversation_id") or parsed.get("uuid"),
+            len(str(parsed.get("result", ""))),
+            result_preview,
+            list(parsed.keys())
+        )
 
         return parsed
 
@@ -280,7 +339,8 @@ class ClaudeCodeCliModel(BaseChatModel):
 
     def _parse_response(self, response: dict) -> ChatResult:
         """Convert ttadk JSON response to LangChain ChatResult."""
-        # Extract session_id for continuity
+        old_session_id = self._session_id
+
         for key in ("session_id", "conversation_id", "uuid"):
             sid = response.get(key)
             if sid:
@@ -289,6 +349,12 @@ class ClaudeCodeCliModel(BaseChatModel):
 
         result_text = response.get("result", "")
         usage = response.get("usage", {})
+
+        logger.warning(
+            "[CCM] _parse_response: session_id %s -> %s, result_text=%d chars, empty=%s",
+            old_session_id, self._session_id,
+            len(result_text), result_text == ""
+        )
 
         message = AIMessage(
             content=result_text,
