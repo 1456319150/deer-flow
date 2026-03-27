@@ -77,6 +77,16 @@ def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *
         elif "reasoning_effort" not in model_settings_from_config:
             model_settings_from_config["reasoning_effort"] = "medium"
 
+    # For Claude Code CLI models: strip unsupported LLM params
+    from deerflow.models.claude_code_cli_provider import ClaudeCodeCliModel
+
+    if issubclass(model_class, ClaudeCodeCliModel):
+        # Claude Code CLI only accepts: model, target, timeout, allowed_tools, ttadk_cmd
+        # Strip standard LLM params that don't apply
+        for key in ("max_tokens", "temperature", "top_p", "reasoning_effort"):
+            model_settings_from_config.pop(key, None)
+            kwargs.pop(key, None)
+
     model_instance = model_class(**kwargs, **model_settings_from_config)
 
     if is_tracing_enabled():

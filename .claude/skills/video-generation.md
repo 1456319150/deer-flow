@@ -1,0 +1,1 @@
+../../skills/public/video-generation/SKILL.md

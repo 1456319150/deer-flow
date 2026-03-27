@@ -1,0 +1,1 @@
+../../skills/public/ppt-generation/SKILL.md

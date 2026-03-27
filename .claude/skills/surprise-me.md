@@ -1,0 +1,1 @@
+../../skills/public/surprise-me/SKILL.md

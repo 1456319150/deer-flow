@@ -1,0 +1,1 @@
+../../skills/public/skill-creator/SKILL.md

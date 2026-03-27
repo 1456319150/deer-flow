@@ -1,0 +1,1 @@
+../../skills/public/bootstrap/SKILL.md

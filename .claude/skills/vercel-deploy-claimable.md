@@ -1,0 +1,1 @@
+../../skills/public/vercel-deploy-claimable/SKILL.md

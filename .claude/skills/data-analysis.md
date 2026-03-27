@@ -1,0 +1,1 @@
+../../skills/public/data-analysis/SKILL.md

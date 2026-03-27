@@ -1,0 +1,1 @@
+../../skills/public/github-deep-research/SKILL.md

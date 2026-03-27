@@ -1,0 +1,1 @@
+../../skills/public/find-skills/SKILL.md

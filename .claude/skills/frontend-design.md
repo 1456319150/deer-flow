@@ -1,0 +1,1 @@
+../../skills/public/frontend-design/SKILL.md
