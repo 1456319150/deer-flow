@@ -13,6 +13,9 @@ Key design:
   - DeerFlow system prompt is SKIPPED — Claude Code has its own system prompt + skills.
     Passing DeerFlow's 9KB prompt through CLI args causes escaping/size issues and
     references tools that don't exist in Claude Code's environment.
+  - Multi-turn: when session_id exists, only the latest user message is sent.
+    Claude Code maintains conversation context via --resume, so re-sending
+    history is redundant and causes escaping issues with AI response content.
 
 Config example (config.yaml):
     - name: claude-code
@@ -93,12 +96,26 @@ class ClaudeCodeCliModel(BaseChatModel):
     def _flatten_messages(self, messages: list[BaseMessage]) -> str:
         """Convert LangChain message list into a single prompt string.
 
-        Claude Code runs its own agent loop with its own system prompt,
-        so DeerFlow's system prompt is intentionally skipped to avoid:
-        1. CLI argument size/escaping issues with 9KB+ prompts
-        2. Tool reference conflicts (DeerFlow tools != Claude Code tools)
-        3. Clarification middleware traps on simple inputs
+        Two modes depending on session state:
+
+        1. Resuming (session_id exists): Only send the latest HumanMessage.
+           Claude Code maintains full conversation context via --resume,
+           so re-sending history is redundant and causes CLI arg escaping
+           issues when AI responses contain special characters.
+
+        2. First turn (no session_id): Send all non-system messages.
+           System prompt is always skipped — Claude Code has its own.
         """
+        # Resuming: Claude Code already has context, only send new input
+        if self._session_id:
+            for msg in reversed(messages):
+                if isinstance(msg, HumanMessage):
+                    content = self._normalize_content(msg.content)
+                    if content:
+                        return content
+            return ""
+
+        # First turn: send all non-system messages
         conversation_parts: list[str] = []
 
         for msg in messages:
@@ -108,8 +125,6 @@ class ClaudeCodeCliModel(BaseChatModel):
 
             if isinstance(msg, SystemMessage):
                 # Skip: Claude Code has its own system prompt + skills.
-                # DeerFlow's system prompt references tools/paths that
-                # don't exist in Claude Code's environment.
                 continue
             elif isinstance(msg, HumanMessage):
                 conversation_parts.append(content)
@@ -167,7 +182,7 @@ class ClaudeCodeCliModel(BaseChatModel):
     def _call_cli_sync(self, prompt: str) -> dict:
         """Execute ttadk code synchronously and return parsed JSON."""
         cmd = self._build_cli_args(prompt)
-        logger.info(f"ClaudeCodeCli: calling ttadk (model={self.model}, target={self.target})")
+        logger.info(f"ClaudeCodeCli: calling ttadk (model={self.model}, target={self.target}, resume={bool(self._session_id)})")
 
         try:
             proc = subprocess.Popen(
@@ -215,7 +230,7 @@ class ClaudeCodeCliModel(BaseChatModel):
     async def _call_cli_async(self, prompt: str) -> dict:
         """Execute ttadk code asynchronously."""
         cmd = self._build_cli_args(prompt)
-        logger.info(f"ClaudeCodeCli: async calling ttadk (model={self.model}, target={self.target})")
+        logger.info(f"ClaudeCodeCli: async calling ttadk (model={self.model}, target={self.target}, resume={bool(self._session_id)})")
 
         try:
             proc = await asyncio.create_subprocess_exec(
