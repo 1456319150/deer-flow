@@ -14,6 +14,7 @@ models:
     model: gpt-5.4
     target: claude
     timeout: 600
+    allowed_tools: "Bash,Read,Write,Edit"
 
 tool_groups:
   - name: web
