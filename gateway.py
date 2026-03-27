@@ -34,8 +34,27 @@ log = logging.getLogger("gateway")
 # Config
 # ===========================================================================
 
+def load_dotenv(path: str = ".env") -> None:
+    """Load .env file into os.environ. No extra dependency needed."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip("'\"")  # Strip surrounding quotes
+                os.environ.setdefault(key, val)  # Existing env vars take priority
+    except FileNotFoundError:
+        pass
+
+
 def load_config(path: str = "config.yaml") -> dict:
-    """Load YAML config with $ENV_VAR substitution."""
+    """Load .env then YAML config with $ENV_VAR substitution."""
+    load_dotenv()
     with open(path) as f:
         text = f.read()
     for match in set(re.findall(r"\$([A-Z_][A-Z0-9_]*)", text)):
