@@ -152,7 +152,9 @@ class ClaudeCodeCliModel(BaseChatModel):
 
     def _build_cli_args(self, prompt: str) -> list[str]:
         """Build the ttadk CLI command as a list of arguments."""
-        safe_prompt = json.dumps(prompt, ensure_ascii=False)
+        # Escape single quotes for shell-like arg parsing (ttadk parses -a value)
+        # Escape single quotes for shell-like arg parsing in ttadk
+        safe_prompt = "'" + prompt.replace("'", "'\"'\"'") + "'"
         a_parts = [f"-p {safe_prompt}", "--output-format json"]
 
         if self._session_id:
