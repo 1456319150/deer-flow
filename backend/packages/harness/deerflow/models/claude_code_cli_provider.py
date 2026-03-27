@@ -10,6 +10,9 @@ Key design:
   - bind_tools() is a no-op — DeerFlow's tools are NOT forwarded to Claude Code
   - --allowedTools controls which Claude Code built-in tools are available
   - Session continuity via --resume (optional, keyed by DeerFlow thread_id)
+  - DeerFlow system prompt is SKIPPED — Claude Code has its own system prompt + skills.
+    Passing DeerFlow's 9KB prompt through CLI args causes escaping/size issues and
+    references tools that don't exist in Claude Code's environment.
 
 Config example (config.yaml):
     - name: claude-code
@@ -90,11 +93,12 @@ class ClaudeCodeCliModel(BaseChatModel):
     def _flatten_messages(self, messages: list[BaseMessage]) -> str:
         """Convert LangChain message list into a single prompt string.
 
-        Simple approach: Claude Code's -p flag takes a plain text prompt.
-        For single messages, pass content directly. For multi-turn, use
-        minimal role prefixes separated by newlines.
+        Claude Code runs its own agent loop with its own system prompt,
+        so DeerFlow's system prompt is intentionally skipped to avoid:
+        1. CLI argument size/escaping issues with 9KB+ prompts
+        2. Tool reference conflicts (DeerFlow tools != Claude Code tools)
+        3. Clarification middleware traps on simple inputs
         """
-        system_parts: list[str] = []
         conversation_parts: list[str] = []
 
         for msg in messages:
@@ -103,26 +107,18 @@ class ClaudeCodeCliModel(BaseChatModel):
                 continue
 
             if isinstance(msg, SystemMessage):
-                system_parts.append(content)
+                # Skip: Claude Code has its own system prompt + skills.
+                # DeerFlow's system prompt references tools/paths that
+                # don't exist in Claude Code's environment.
+                continue
             elif isinstance(msg, HumanMessage):
                 conversation_parts.append(content)
             elif isinstance(msg, AIMessage):
-                if content:
-                    conversation_parts.append(f"Assistant: {content}")
+                conversation_parts.append(f"Assistant: {content}")
             elif isinstance(msg, ToolMessage):
                 conversation_parts.append(f"Tool result: {content}")
 
-        parts = []
-        if system_parts:
-            parts.extend(system_parts)
-        if conversation_parts:
-            # If only one user message and no system, return it directly
-            if len(parts) == 0 and len(conversation_parts) == 1 and not isinstance(messages[-1], (AIMessage, ToolMessage)):
-                return conversation_parts[0]
-            parts.extend(conversation_parts)
-
-        return "\n\n".join(parts)
-
+        return "\n\n".join(conversation_parts) if conversation_parts else ""
 
     # ─── JSON extraction (from claude_chain.py) ──────────────────────
 
