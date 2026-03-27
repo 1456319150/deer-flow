@@ -7,9 +7,6 @@ token_usage:
   enabled: true
 
 models:
-  # Primary model: Claude Code via ttadk CLI
-  # Claude Code runs its own agent loop with built-in tools (Bash, Read, Write, Edit, etc.)
-  # DeerFlow acts as UI/session/memory layer only.
   - name: claude-code
     display_name: Claude Code (ttadk)
     description: Claude Code agent via ttadk CLI — full agent loop with built-in tools
@@ -17,6 +14,63 @@ models:
     model: gpt-5.4
     target: claude
     timeout: 600
-    # Uncomment to restrict which Claude Code tools are available:
-    # allowed_tools: "Bash,Read,Write,Edit,WebSearch"
 
+tool_groups:
+  - name: web
+  - name: file:read
+  - name: file:write
+  - name: bash
+
+tools:
+  - name: web_search
+    group: web
+    use: deerflow.community.ddg_search.tools:web_search_tool
+    max_results: 5
+  - name: web_fetch
+    group: web
+    use: deerflow.community.jina_ai.tools:web_fetch_tool
+    timeout: 10
+  - name: image_search
+    group: web
+    use: deerflow.community.image_search.tools:image_search_tool
+    max_results: 5
+  - name: ls
+    group: file:read
+    use: deerflow.sandbox.tools:ls_tool
+  - name: read_file
+    group: file:read
+    use: deerflow.sandbox.tools:read_file_tool
+  - name: write_file
+    group: file:write
+    use: deerflow.sandbox.tools:write_file_tool
+  - name: str_replace
+    group: file:write
+    use: deerflow.sandbox.tools:str_replace_tool
+  - name: bash
+    group: bash
+    use: deerflow.sandbox.tools:bash_tool
+
+tool_search:
+  enabled: false
+
+sandbox:
+  use: deerflow.sandbox.local:LocalSandboxProvider
+
+skills:
+  container_path: /mnt/skills
+
+title:
+  enabled: true
+  max_words: 6
+  max_chars: 60
+  model_name: null
+
+summarization:
+  enabled: false
+
+memory:
+  enabled: false
+
+checkpointer:
+  type: sqlite
+  connection_string: checkpoints.db
