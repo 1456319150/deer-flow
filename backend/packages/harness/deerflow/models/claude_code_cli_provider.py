@@ -90,39 +90,39 @@ class ClaudeCodeCliModel(BaseChatModel):
     def _flatten_messages(self, messages: list[BaseMessage]) -> str:
         """Convert LangChain message list into a single prompt string.
 
-        Preserves role structure via XML tags so Claude Code understands
-        the conversation context. System messages are prioritized as instructions.
+        Simple approach: Claude Code's -p flag takes a plain text prompt.
+        For single messages, pass content directly. For multi-turn, use
+        minimal role prefixes separated by newlines.
         """
         system_parts: list[str] = []
         conversation_parts: list[str] = []
 
         for msg in messages:
             content = self._normalize_content(msg.content)
-            if not content and not (isinstance(msg, AIMessage) and msg.tool_calls):
+            if not content:
                 continue
 
             if isinstance(msg, SystemMessage):
                 system_parts.append(content)
             elif isinstance(msg, HumanMessage):
-                conversation_parts.append(f"[User]: {content}")
+                conversation_parts.append(content)
             elif isinstance(msg, AIMessage):
                 if content:
-                    conversation_parts.append(f"[Assistant]: {content}")
-                if msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        args_str = json.dumps(tc["args"], ensure_ascii=False) if isinstance(tc["args"], dict) else str(tc["args"])
-                        conversation_parts.append(f"[Tool Call: {tc['name']}]: {args_str}")
+                    conversation_parts.append(f"Assistant: {content}")
             elif isinstance(msg, ToolMessage):
-                conversation_parts.append(f"[Tool Result ({msg.tool_call_id})]: {content}")
+                conversation_parts.append(f"Tool result: {content}")
 
-        # Build final prompt: system context first, then conversation
         parts = []
         if system_parts:
-            parts.append("=== System Instructions ===\n" + "\n\n".join(system_parts))
+            parts.extend(system_parts)
         if conversation_parts:
-            parts.append("=== Conversation ===\n" + "\n\n".join(conversation_parts))
+            # If only one user message and no system, return it directly
+            if len(parts) == 0 and len(conversation_parts) == 1 and not isinstance(messages[-1], (AIMessage, ToolMessage)):
+                return conversation_parts[0]
+            parts.extend(conversation_parts)
 
         return "\n\n".join(parts)
+
 
     # ─── JSON extraction (from claude_chain.py) ──────────────────────
 
