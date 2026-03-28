@@ -7,12 +7,19 @@ Architecture:
     Feishu WebSocket (lark-oapi)
         → FeishuBot._on_message()
             → ClaudeCodeBridge.ask(topic_id, text)
-                → ttadk code -t claude (subprocess)
-            ← result text
-        ← update Feishu card with result
+                → ttadk code -t claude (subprocess, stream-json mode)
+            ← StreamResult (thinking + tool_use + text)
+        ← update Feishu card with rich result
 
 Session continuity:
     topic_id (root_id or msg_id) → ttadk session_id via --resume
+
+stream-json workaround:
+    Claude Code's --output-format json has a known bug where `result` is
+    often empty despite the model generating a full response. We use
+    --output-format stream-json --verbose instead, and extract the actual
+    text from {"type":"assistant"} events in the stream.
+    See: https://github.com/anthropics/claude-code/issues/38706
 """
 
 from __future__ import annotations
@@ -23,6 +30,8 @@ import logging
 import os
 import re
 import threading
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
@@ -42,53 +51,79 @@ def load_dotenv(path: str = ".env") -> None:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                if "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                key = key.strip()
-                val = val.strip().strip("'\"")  # Strip surrounding quotes
-                os.environ.setdefault(key, val)  # Existing env vars take priority
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    key, value = key.strip(), value.strip()
+                    for q in ('"', "'"):
+                        if value.startswith(q) and value.endswith(q):
+                            value = value[1:-1]
+                            break
+                    os.environ.setdefault(key, value)
     except FileNotFoundError:
         pass
 
 
 def load_config(path: str = "config.yaml") -> dict:
-    """Load .env then YAML config with $ENV_VAR substitution."""
     load_dotenv()
     with open(path) as f:
-        text = f.read()
-    for match in set(re.findall(r"\$([A-Z_][A-Z0-9_]*)", text)):
-        text = text.replace(f"${match}", os.environ.get(match, ""))
-    return yaml.safe_load(text)
+        raw = f.read()
+    resolved = re.sub(r"\$\{(\w+)}", lambda m: os.environ.get(m.group(1), ""), raw)
+    return yaml.safe_load(resolved)
 
 
 # ===========================================================================
-# Claude Code Bridge — ttadk CLI wrapper
+# Stream Result
 # ===========================================================================
 
-# Fields where ttadk may put the actual text response, in priority order
-_RESULT_FIELDS = ("result", "content", "text", "output", "response", "message", "answer")
+@dataclass
+class ToolCall:
+    """A single tool invocation: what was called and its result."""
+    name: str
+    input_text: str
+    output_text: str = ""
 
-# Fields that hold session identifiers
-_SESSION_FIELDS = ("session_id", "conversation_id", "uuid")
 
+@dataclass
+class StreamResult:
+    """Structured result from parsing stream-json events."""
+    thinking: list[str] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    assistant_texts: list[str] = field(default_factory=list)
+    result_text: str = ""
+    session_id: str | None = None
+
+    @property
+    def reply_text(self) -> str:
+        """Primary text to show: result if present, else combined assistant texts."""
+        if self.result_text:
+            return self.result_text
+        if self.assistant_texts:
+            return "\n\n".join(self.assistant_texts)
+        return ""
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.reply_text and not self.tool_calls
+
+
+# ===========================================================================
+# Claude Code Bridge
+# ===========================================================================
 
 class ClaudeCodeBridge:
-    """Calls Claude Code via ttadk subprocess. Tracks sessions per topic."""
+    """Wraps ttadk CLI to talk to Claude Code."""
 
     def __init__(self, cfg: dict):
         self.ttadk_cmd: str = cfg.get("ttadk_cmd", "ttadk")
         self.model: str = cfg.get("model", "gpt-5.4")
         self.target: str = cfg.get("target", "claude")
         self.timeout: int = cfg.get("timeout", 600)
-        self.allowed_tools: str = cfg.get("allowed_tools", "Bash,Read,Write,Edit")
-        # NOTE: --system-prompt breaks Claude Code's built-in agent loop.
-        # Instead, we prepend custom instructions to the user prompt.
+        self.allowed_tools: str = cfg.get("allowed_tools", "")
         self.instruction: str = cfg.get("instruction", "")
-        self._sessions: dict[str, str] = {}  # topic_id → session_id
+        self._sessions: dict[str, str] = {}
 
-    async def ask(self, topic_id: str, prompt: str) -> str:
-        """Send prompt to Claude Code, return text response."""
+    async def ask(self, topic_id: str, prompt: str) -> StreamResult:
+        """Send prompt to Claude Code, return structured StreamResult."""
         session_id = self._sessions.get(topic_id)
         # Prepend custom instruction (if any) to user prompt
         full_prompt = f"{self.instruction}\n\n{prompt}" if self.instruction else prompt
@@ -99,7 +134,7 @@ class ClaudeCodeBridge:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdin=asyncio.subprocess.DEVNULL,  # Critical: prevent stdin corruption
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -107,9 +142,13 @@ class ClaudeCodeBridge:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
-            return f"⏰ Claude Code timed out after {self.timeout}s"
+            r = StreamResult()
+            r.assistant_texts = [f"⏰ Claude Code timed out after {self.timeout}s"]
+            return r
         except FileNotFoundError:
-            return f"❌ Command not found: {self.ttadk_cmd}. Is ttadk installed and in PATH?"
+            r = StreamResult()
+            r.assistant_texts = [f"❌ Command not found: {self.ttadk_cmd}. Is ttadk installed and in PATH?"]
+            return r
 
         raw = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
         log.info("[Bridge] exit=%d output=%d chars", proc.returncode, len(raw))
@@ -118,167 +157,149 @@ class ClaudeCodeBridge:
         for pattern in (r"https?://\S*auth\S*", r"https?://\S*login\S*", r"https?://\S*oauth\S*"):
             urls = re.findall(pattern, raw)
             if urls:
-                return f"🔐 需要认证，请在浏览器打开: {urls[0]}"
+                r = StreamResult()
+                r.assistant_texts = [f"🔐 需要认证，请在浏览器打开: {urls[0]}"]
+                return r
 
-        # Parse JSON response
-        parsed = self._extract_json(raw)
-        if parsed is None:
-            tail = "\n".join(raw.strip().splitlines()[-20:])
-            return tail or "(empty response)"
-
-        log.debug("[Bridge] parsed keys=%s", list(parsed.keys()))
+        # Parse stream-json output
+        result = self._parse_stream(raw)
 
         # Update session for multi-turn continuity
-        for key in _SESSION_FIELDS:
-            sid = parsed.get(key)
-            if sid:
-                self._sessions[topic_id] = sid
-                log.info("[Bridge] session: topic=%s → %s", topic_id, sid)
-                break
+        if result.session_id:
+            self._sessions[topic_id] = result.session_id
+            log.info("[Bridge] session: topic=%s → %s", topic_id, result.session_id)
 
-        # Extract result text — try multiple known field names
-        result = self._extract_result(parsed)
-        if result:
-            return result
-
-        # result is empty — this happens when Claude Code used tools
-        # (e.g. Read to show file contents) but didn't write a text summary.
-        log.warning("[Bridge] Empty result. turns=%s tokens=%s",
-                     parsed.get("num_turns"), parsed.get("usage", {}).get("output_tokens"))
-        return "(Claude Code 已执行操作但未生成文字回复，请尝试更具体的提问)"
+        return result
 
     @staticmethod
-    def _extract_result(parsed: dict) -> str:
-        """Try multiple field names to find the actual text response."""
-        # 1. Direct top-level fields
-        for key in _RESULT_FIELDS:
-            val = parsed.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-            # Handle case where result is a list of message dicts
-            if isinstance(val, list):
-                texts = []
-                for item in val:
-                    if isinstance(item, str):
-                        texts.append(item)
-                    elif isinstance(item, dict):
-                        for sub_key in ("text", "content", "message", "value"):
-                            sv = item.get(sub_key)
-                            if isinstance(sv, str) and sv.strip():
-                                texts.append(sv.strip())
-                                break
-                if texts:
-                    return "\n".join(texts)
+    def _parse_stream(raw: str) -> StreamResult:
+        """Parse stream-json output from Claude Code CLI.
 
-        # 2. Nested under "data" or "choices" (common API patterns)
-        data = parsed.get("data")
-        if isinstance(data, dict):
-            for key in _RESULT_FIELDS:
-                val = data.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
+        Extracts ALL valuable event types:
+        - thinking: Claude's reasoning process
+        - tool_use + tool_result: what commands/files were accessed
+        - text: the final response text
+        - result: the result field (often empty due to bug)
+        - session_id: for multi-turn continuity
 
-        choices = parsed.get("choices")
-        if isinstance(choices, list) and choices:
-            first = choices[0]
-            if isinstance(first, dict):
-                msg = first.get("message") or first.get("delta") or first
-                if isinstance(msg, dict):
-                    for key in ("content", "text"):
-                        val = msg.get(key)
-                        if isinstance(val, str) and val.strip():
-                            return val.strip()
+        Event format examples:
+        {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+        {"type":"assistant","message":{"content":[{"type":"thinking","thinking":"..."}]}}
+        {"type":"assistant","message":{"content":[{"type":"tool_use","id":"...","name":"Bash","input":{"command":"ls"}}]}}
+        {"type":"assistant","message":{"content":[{"type":"tool_result","tool_use_id":"...","content":"output"}]}}
+        {"type":"result","result":"","session_id":"..."}
+        """
+        result = StreamResult()
+        # Track pending tool_use by id so we can pair with tool_result
+        pending_tools: dict[str, ToolCall] = {}
 
-        return ""
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("{"):
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
 
-    @staticmethod
-    def _collect_strings(obj: Any, out: list[str], skip_keys: set | None = None, depth: int = 0) -> None:
-        """Recursively collect non-trivial string values from a JSON structure."""
-        if depth > 5:
-            return
-        if isinstance(obj, str):
-            if len(obj.strip()) > 2:  # Skip trivial strings like "ok"
-                out.append(obj.strip())
-        elif isinstance(obj, dict):
-            for k, v in obj.items():
-                if skip_keys and k in skip_keys:
-                    continue
-                ClaudeCodeBridge._collect_strings(v, out, skip_keys, depth + 1)
-        elif isinstance(obj, list):
-            for item in obj:
-                ClaudeCodeBridge._collect_strings(item, out, skip_keys, depth + 1)
+            event_type = event.get("type")
+
+            if event_type == "assistant":
+                message = event.get("message", {})
+                content = message.get("content", [])
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+
+                    if block_type == "text":
+                        text = block.get("text", "").strip()
+                        if text:
+                            result.assistant_texts.append(text)
+
+                    elif block_type == "thinking":
+                        thinking = block.get("thinking", "").strip()
+                        if thinking:
+                            result.thinking.append(thinking)
+
+                    elif block_type == "tool_use":
+                        tool_id = block.get("id", "")
+                        name = block.get("name", "unknown")
+                        inp = block.get("input", {})
+                        # Format input for display
+                        if isinstance(inp, dict):
+                            # Common patterns: Bash has command, Read has file_path, etc.
+                            if "command" in inp:
+                                input_text = inp["command"]
+                            elif "file_path" in inp:
+                                input_text = inp["file_path"]
+                            elif "query" in inp:
+                                input_text = inp["query"]
+                            else:
+                                input_text = json.dumps(inp, ensure_ascii=False)
+                        else:
+                            input_text = str(inp)
+                        tc = ToolCall(name=name, input_text=input_text)
+                        result.tool_calls.append(tc)
+                        if tool_id:
+                            pending_tools[tool_id] = tc
+
+                    elif block_type == "tool_result":
+                        tool_use_id = block.get("tool_use_id", "")
+                        content_val = block.get("content", "")
+                        if isinstance(content_val, list):
+                            # content can be a list of text blocks
+                            parts = []
+                            for item in content_val:
+                                if isinstance(item, dict) and item.get("type") == "text":
+                                    parts.append(item.get("text", ""))
+                                elif isinstance(item, str):
+                                    parts.append(item)
+                            output = "\n".join(parts)
+                        elif isinstance(content_val, str):
+                            output = content_val
+                        else:
+                            output = str(content_val)
+                        if tool_use_id in pending_tools:
+                            pending_tools[tool_use_id].output_text = output.strip()
+
+                    # redacted_thinking: encrypted, not useful — skip
+
+            elif event_type == "result":
+                result.result_text = (event.get("result") or "").strip()
+                result.session_id = event.get("session_id")
+
+        return result
 
     def _build_cmd(self, prompt: str, session_id: str | None) -> list[str]:
         """Build ttadk CLI command list."""
-        # Escape for shell single-quote context
         safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
-
         parts = [
             f"-p {safe(prompt)}",
-            "--output-format json",
+            "--output-format stream-json",
+            "--verbose",
         ]
         if session_id:
             parts.insert(0, f"--resume {session_id}")
         if self.allowed_tools:
             parts.append(f"--allowedTools {self.allowed_tools}")
-
         return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
-
-    @staticmethod
-    def _extract_json(output: str) -> dict | None:
-        """Extract last valid JSON object from mixed CLI output.
-
-        Strategy:
-        1. Scan lines from bottom — fast path for single-line JSON
-        2. Try multi-line JSON — brace-matching from last '{' to matching '}'
-        3. Regex fallback — find nested JSON patterns
-        """
-        lines = output.splitlines()
-
-        # Pass 1: single-line JSON from bottom
-        for line in reversed(lines):
-            stripped = line.strip()
-            if stripped.startswith("{") and stripped.endswith("}"):
-                try:
-                    return json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-
-        # Pass 2: multi-line JSON — find last '{' and try to match '}'
-        last_brace = output.rfind("{")
-        while last_brace >= 0:
-            # Try progressively larger substrings
-            depth = 0
-            for i in range(last_brace, len(output)):
-                if output[i] == "{":
-                    depth += 1
-                elif output[i] == "}":
-                    depth -= 1
-                if depth == 0:
-                    candidate = output[last_brace : i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except json.JSONDecodeError:
-                        break
-            # Try previous '{'
-            last_brace = output.rfind("{", 0, last_brace)
-
-        # Pass 3: regex fallback
-        for m in reversed(re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", output)):
-            try:
-                return json.loads(m)
-            except json.JSONDecodeError:
-                continue
-
-        return None
 
 
 # ===========================================================================
-# Feishu Bot — lark-oapi WebSocket (no public IP needed)
+# Feishu Bot
 # ===========================================================================
 
 class FeishuBot:
-    """Receives Feishu messages via WebSocket, forwards to ClaudeCodeBridge."""
+    """Feishu WebSocket bot with card-based responses."""
+
+    # Truncation limits
+    MAX_REPLY = 50000
+    MAX_THINKING = 2000
+    MAX_TOOL_INPUT = 500
+    MAX_TOOL_OUTPUT = 1000
+    MAX_TOOL_CALLS_SHOWN = 10
+    MSG_MAX_AGE = 120  # Ignore messages older than 2 minutes (offline replay protection)
 
     def __init__(self, cfg: dict, bridge: ClaudeCodeBridge):
         self.app_id: str = cfg["app_id"]
@@ -287,8 +308,8 @@ class FeishuBot:
         self._api_client: Any = None
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._ws_thread: threading.Thread | None = None
-        # Feishu SDK message classes (lazy-loaded)
         self._sdk: dict[str, Any] = {}
+        self._seen_msgs: set[str] = set()  # msg_id dedup
 
     async def start(self) -> None:
         """Initialize API client and start WebSocket listener."""
@@ -321,18 +342,14 @@ class FeishuBot:
         log.info("✅ Feishu bot started (app_id=%s)", self.app_id)
 
     def _run_ws(self) -> None:
-        """Run lark WS client in a thread with its own event loop.
-
-        lark-oapi caches a module-level event loop and calls run_until_complete(),
-        which conflicts with the main thread's running loop. We patch it.
-        """
+        """Run lark WS client in a thread with its own event loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             import lark_oapi as lark
             import lark_oapi.ws.client as ws_mod
 
-            ws_mod.loop = loop  # Patch SDK's module-level loop
+            ws_mod.loop = loop
 
             handler = (
                 lark.EventDispatcherHandler.builder("", "")
@@ -349,8 +366,6 @@ class FeishuBot:
         except Exception:
             log.exception("Feishu WebSocket error")
 
-    # --- Message handler ---
-
     def _on_message(self, event: Any) -> None:
         """Handle incoming message (runs in lark thread)."""
         try:
@@ -358,7 +373,24 @@ class FeishuBot:
             chat_id = msg.chat_id
             msg_id = msg.message_id
             root_id = getattr(msg, "root_id", None) or None
-            topic_id = root_id or msg_id  # Thread replies share the same topic
+            topic_id = root_id or msg_id
+
+            # --- Dedup: skip already-processed messages ---
+            if msg_id in self._seen_msgs:
+                log.debug("[MSG] skip duplicate msg=%s", msg_id)
+                return
+            self._seen_msgs.add(msg_id)
+            # Cap set size to prevent unbounded growth
+            if len(self._seen_msgs) > 10000:
+                self._seen_msgs.clear()
+
+            # --- Staleness: skip messages sent while bot was offline ---
+            create_time_ms = int(getattr(msg, "create_time", "0") or "0")
+            if create_time_ms:
+                age = time.time() - create_time_ms / 1000
+                if age > self.MSG_MAX_AGE:
+                    log.info("[MSG] skip stale msg=%s age=%.0fs", msg_id, age)
+                    return
 
             content = json.loads(msg.content)
             text = self._extract_text(content).strip()
@@ -378,31 +410,86 @@ class FeishuBot:
 
     async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
         """Full message lifecycle: react → thinking card → Claude Code → update card → done."""
-        # 1. OK reaction (fire-and-forget)
         asyncio.create_task(self._react(msg_id, "OK"))
-
-        # 2. Reply with "thinking..." card in thread
         card_id = await self._reply_card(msg_id, "🤔 Thinking...")
 
-        # 3. Call Claude Code
         try:
             result = await self.bridge.ask(topic_id, text)
         except Exception as e:
             log.exception("Bridge error")
-            result = f"❌ Error: {e}"
+            r = StreamResult()
+            r.assistant_texts = [f"❌ Error: {e}"]
+            result = r
 
-        # 4. Truncate if too long for Feishu card (100KB limit, ~50K chars safe)
-        if len(result) > 50000:
-            result = result[:50000] + "\n\n... (truncated, response too long)"
+        card_content = self._format_result(result)
 
-        # 5. Update card with result
         if card_id:
-            await self._update_card(card_id, result)
+            await self._update_card(card_id, card_content)
         else:
-            await self._reply_card(msg_id, result)
+            await self._reply_card(msg_id, card_content)
 
-        # 6. DONE reaction
         await self._react(msg_id, "DONE")
+
+    @classmethod
+    def _format_result(cls, result: StreamResult) -> str:
+        """Format StreamResult into rich Markdown for Feishu card.
+
+        Layout:
+        1. 💭 Thinking (collapsed if long) — shows Claude's reasoning
+        2. 🔧 Tool Calls — shows what commands/files were accessed
+        3. 📝 Reply — the actual response text
+        """
+        sections: list[str] = []
+
+        # --- Thinking section ---
+        if result.thinking:
+            combined_thinking = "\n\n".join(result.thinking)
+            if len(combined_thinking) > cls.MAX_THINKING:
+                combined_thinking = combined_thinking[:cls.MAX_THINKING] + "\n\n... (thinking truncated)"
+            sections.append(f"**💭 Thinking**\n> {cls._blockquote(combined_thinking)}")
+
+        # --- Tool calls section ---
+        if result.tool_calls:
+            tool_lines: list[str] = []
+            shown = result.tool_calls[:cls.MAX_TOOL_CALLS_SHOWN]
+            for i, tc in enumerate(shown, 1):
+                input_display = tc.input_text
+                if len(input_display) > cls.MAX_TOOL_INPUT:
+                    input_display = input_display[:cls.MAX_TOOL_INPUT] + "..."
+
+                tool_lines.append(f"**{i}. {tc.name}**")
+                tool_lines.append(f"`{input_display}`")
+
+                if tc.output_text:
+                    output_display = tc.output_text
+                    if len(output_display) > cls.MAX_TOOL_OUTPUT:
+                        output_display = output_display[:cls.MAX_TOOL_OUTPUT] + "..."
+                    tool_lines.append(f"> {cls._blockquote(output_display)}")
+
+            remaining = len(result.tool_calls) - cls.MAX_TOOL_CALLS_SHOWN
+            if remaining > 0:
+                tool_lines.append(f"*... and {remaining} more tool calls*")
+
+            sections.append(f"**🔧 Tool Calls ({len(result.tool_calls)})**\n" + "\n".join(tool_lines))
+
+        # --- Reply section ---
+        reply = result.reply_text
+        if reply:
+            if len(reply) > cls.MAX_REPLY:
+                reply = reply[:cls.MAX_REPLY] + "\n\n... (truncated, response too long)"
+            # If there are process sections above, add a separator
+            if sections:
+                sections.append("---")
+            sections.append(reply)
+        elif result.is_empty:
+            sections.append("(Claude Code 已执行操作但未生成文字回复，请尝试更具体的提问)")
+
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _blockquote(text: str) -> str:
+        """Convert multi-line text to blockquote format."""
+        return "\n> ".join(text.split("\n"))
 
     # --- Feishu API helpers ---
 
@@ -425,7 +512,6 @@ class FeishuBot:
             log.debug("React %s failed for %s", emoji, msg_id, exc_info=True)
 
     async def _reply_card(self, msg_id: str, text: str) -> str | None:
-        """Reply with interactive card in thread, return card message_id."""
         try:
             req = (
                 self._sdk["ReplyReq"]
@@ -463,7 +549,6 @@ class FeishuBot:
 
     @staticmethod
     def _card(text: str) -> str:
-        """Build Feishu interactive card JSON (renders markdown natively)."""
         return json.dumps({
             "config": {"wide_screen_mode": True, "update_multi": True},
             "elements": [{"tag": "markdown", "content": text}],
@@ -471,11 +556,8 @@ class FeishuBot:
 
     @staticmethod
     def _extract_text(content: dict) -> str:
-        """Extract plain text from Feishu message content (text + rich text)."""
-        # Plain text message
         if "text" in content:
             return content["text"]
-        # Rich text (post) message
         if "content" in content and isinstance(content["content"], list):
             paras = []
             for para in content["content"]:
@@ -518,7 +600,7 @@ async def main() -> None:
 
     log.info("🚀 Gateway running. Ctrl+C to stop.")
     try:
-        await asyncio.Event().wait()  # Block forever
+        await asyncio.Event().wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutting down...")
 

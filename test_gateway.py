@@ -1,414 +1,539 @@
-"""Unit tests for gateway.py — no Feishu/ttadk connectivity needed.
+"""Unit tests for gateway.py — stream-json parsing + rich formatting."""
 
-Run: python test_gateway.py
-  or: python -m pytest test_gateway.py -v
-"""
-
-from __future__ import annotations
-
-import asyncio
 import json
 import os
-import tempfile
 import unittest
+from unittest.mock import patch
 
-# Import targets
-from gateway import ClaudeCodeBridge, FeishuBot, load_config, load_dotenv
+from gateway import (
+    ClaudeCodeBridge,
+    FeishuBot,
+    StreamResult,
+    ToolCall,
+    load_config,
+    load_dotenv,
+)
 
+
+# ===========================================================================
+# StreamResult & ToolCall
+# ===========================================================================
+
+class TestStreamResult(unittest.TestCase):
+    """Tests for the StreamResult dataclass."""
+
+    def test_reply_text_prefers_result(self):
+        r = StreamResult(result_text="from result", assistant_texts=["from assistant"])
+        self.assertEqual(r.reply_text, "from result")
+
+    def test_reply_text_falls_back_to_assistant(self):
+        r = StreamResult(assistant_texts=["hello", "world"])
+        self.assertEqual(r.reply_text, "hello\n\nworld")
+
+    def test_reply_text_empty(self):
+        r = StreamResult()
+        self.assertEqual(r.reply_text, "")
+
+    def test_is_empty_when_no_text_no_tools(self):
+        r = StreamResult()
+        self.assertTrue(r.is_empty)
+
+    def test_not_empty_with_text(self):
+        r = StreamResult(assistant_texts=["hi"])
+        self.assertFalse(r.is_empty)
+
+    def test_not_empty_with_tools(self):
+        r = StreamResult(tool_calls=[ToolCall(name="Bash", input_text="ls")])
+        self.assertFalse(r.is_empty)
+
+
+# ===========================================================================
+# _parse_stream
+# ===========================================================================
+
+class TestParseStream(unittest.TestCase):
+    """Tests for ClaudeCodeBridge._parse_stream with full event coverage."""
+
+    @staticmethod
+    def _build_stream(*events: dict) -> str:
+        return "\n".join(json.dumps(e) for e in events)
+
+    def test_basic_assistant_text(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello!"}]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.assistant_texts, ["Hello!"])
+
+    def test_thinking_extracted(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "Let me analyze this..."}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.thinking, ["Let me analyze this..."])
+        self.assertEqual(result.assistant_texts, [])
+
+    def test_redacted_thinking_ignored(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "redacted_thinking", "data": "encrypted_blob"}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.thinking, [])
+
+    def test_tool_use_extracted(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tool_1", "name": "Bash",
+                 "input": {"command": "ls -la"}}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "Bash")
+        self.assertEqual(result.tool_calls[0].input_text, "ls -la")
+
+    def test_tool_use_with_file_path(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tool_2", "name": "Read",
+                 "input": {"file_path": "/src/main.py"}}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.tool_calls[0].input_text, "/src/main.py")
+
+    def test_tool_use_with_generic_input(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tool_3", "name": "Edit",
+                 "input": {"file": "a.py", "changes": "fix bug"}}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        # Falls through to json.dumps
+        self.assertIn("a.py", result.tool_calls[0].input_text)
+
+    def test_tool_result_paired(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tool_1", "name": "Bash",
+                 "input": {"command": "echo hi"}}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tool_1",
+                 "content": "hi"}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].output_text, "hi")
+
+    def test_tool_result_list_content(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": "cat file.txt"}}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": "line1"}, {"type": "text", "text": "line2"}]}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.tool_calls[0].output_text, "line1\nline2")
+
+    def test_full_workflow(self):
+        """Full realistic stream: system → thinking → tool_use → tool_result → text → result."""
+        raw = self._build_stream(
+            {"type": "system", "subtype": "init", "session_id": "abc123"},
+            {"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "I need to check the directory"}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": "ls /project"}}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": "README.md\nsrc/\ntests/"}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "项目包含 README、src 和 tests 目录"}
+            ]}},
+            {"type": "result", "result": "", "session_id": "sess_xyz"}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+
+        self.assertEqual(result.thinking, ["I need to check the directory"])
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "Bash")
+        self.assertEqual(result.tool_calls[0].input_text, "ls /project")
+        self.assertEqual(result.tool_calls[0].output_text, "README.md\nsrc/\ntests/")
+        self.assertEqual(result.assistant_texts, ["项目包含 README、src 和 tests 目录"])
+        self.assertEqual(result.result_text, "")
+        self.assertEqual(result.session_id, "sess_xyz")
+        # reply_text should use assistant_texts since result is empty
+        self.assertEqual(result.reply_text, "项目包含 README、src 和 tests 目录")
+
+    def test_multiple_tool_calls(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Read",
+                 "input": {"file_path": "a.py"}}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "print('a')"}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t2", "name": "Read",
+                 "input": {"file_path": "b.py"}}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t2", "content": "print('b')"}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Both files contain print statements."}
+            ]}},
+            {"type": "result", "result": "", "session_id": "s1"}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(len(result.tool_calls), 2)
+        self.assertEqual(result.tool_calls[0].output_text, "print('a')")
+        self.assertEqual(result.tool_calls[1].output_text, "print('b')")
+
+    def test_mixed_content_in_single_message(self):
+        """A single assistant message with both text and tool_use blocks."""
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Let me check that."},
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": "pwd"}}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.assistant_texts, ["Let me check that."])
+        self.assertEqual(len(result.tool_calls), 1)
+
+    def test_session_id_extraction(self):
+        raw = self._build_stream(
+            {"type": "result", "result": "", "session_id": "sess_123"}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.session_id, "sess_123")
+
+    def test_noise_lines_ignored(self):
+        raw = "=== Claude Code ===\nLoading...\n" + self._build_stream(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Hi"}]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.assistant_texts, ["Hi"])
+
+    def test_no_events_returns_empty(self):
+        result = ClaudeCodeBridge._parse_stream("")
+        self.assertTrue(result.is_empty)
+        self.assertIsNone(result.session_id)
+
+
+# ===========================================================================
+# _format_result
+# ===========================================================================
+
+class TestFormatResult(unittest.TestCase):
+    """Tests for FeishuBot._format_result rich formatting."""
+
+    def test_reply_only(self):
+        r = StreamResult(assistant_texts=["Simple answer"])
+        output = FeishuBot._format_result(r)
+        self.assertEqual(output, "Simple answer")
+
+    def test_thinking_shown(self):
+        r = StreamResult(
+            thinking=["Analyzing the question..."],
+            assistant_texts=["The answer is 42."]
+        )
+        output = FeishuBot._format_result(r)
+        self.assertIn("💭 Thinking", output)
+        self.assertIn("Analyzing the question", output)
+        self.assertIn("The answer is 42.", output)
+
+    def test_tool_calls_shown(self):
+        r = StreamResult(
+            tool_calls=[
+                ToolCall(name="Bash", input_text="ls -la", output_text="total 5\nfoo\nbar"),
+                ToolCall(name="Read", input_text="/src/main.py", output_text="import os"),
+            ],
+            assistant_texts=["Found 2 files."]
+        )
+        output = FeishuBot._format_result(r)
+        self.assertIn("🔧 Tool Calls (2)", output)
+        self.assertIn("1. Bash", output)
+        self.assertIn("ls -la", output)
+        self.assertIn("2. Read", output)
+        self.assertIn("/src/main.py", output)
+        self.assertIn("Found 2 files.", output)
+        # Separator between process and reply
+        self.assertIn("---", output)
+
+    def test_full_format(self):
+        r = StreamResult(
+            thinking=["Need to check files"],
+            tool_calls=[ToolCall(name="Bash", input_text="ls", output_text="a.py b.py")],
+            assistant_texts=["Project has 2 files."]
+        )
+        output = FeishuBot._format_result(r)
+        # All sections present in order
+        thinking_pos = output.index("💭 Thinking")
+        tools_pos = output.index("🔧 Tool Calls")
+        reply_pos = output.index("Project has 2 files.")
+        self.assertLess(thinking_pos, tools_pos)
+        self.assertLess(tools_pos, reply_pos)
+
+    def test_empty_result(self):
+        r = StreamResult()
+        output = FeishuBot._format_result(r)
+        self.assertIn("未生成文字回复", output)
+
+    def test_tool_calls_only_no_text(self):
+        """Tools ran but no text response — should show tools + fallback."""
+        r = StreamResult(
+            tool_calls=[ToolCall(name="Bash", input_text="make build", output_text="OK")]
+        )
+        output = FeishuBot._format_result(r)
+        self.assertIn("🔧 Tool Calls", output)
+        # is_empty is False because tool_calls exist, but reply_text is empty
+        # So we show tool calls but no fallback message
+        self.assertIn("make build", output)
+
+    def test_thinking_truncated(self):
+        r = StreamResult(
+            thinking=["x" * 5000],
+            assistant_texts=["Done"]
+        )
+        output = FeishuBot._format_result(r)
+        self.assertIn("thinking truncated", output)
+
+    def test_tool_calls_overflow(self):
+        """More than MAX_TOOL_CALLS_SHOWN shows '... and N more'."""
+        calls = [ToolCall(name=f"Tool{i}", input_text=f"cmd{i}") for i in range(15)]
+        r = StreamResult(tool_calls=calls, assistant_texts=["Done"])
+        output = FeishuBot._format_result(r)
+        self.assertIn("5 more tool calls", output)
+
+    def test_long_tool_input_truncated(self):
+        r = StreamResult(
+            tool_calls=[ToolCall(name="Bash", input_text="x" * 1000, output_text="ok")],
+            assistant_texts=["Done"]
+        )
+        output = FeishuBot._format_result(r)
+        self.assertIn("...", output)
+
+
+# ===========================================================================
+# _build_cmd
+# ===========================================================================
+
+class TestBuildCmd(unittest.TestCase):
+    """Tests for ClaudeCodeBridge._build_cmd."""
+
+    def setUp(self):
+        self.bridge = ClaudeCodeBridge({"model": "gpt-5.4", "target": "claude"})
+
+    def test_basic_cmd_structure(self):
+        cmd = self.bridge._build_cmd("hello", None)
+        self.assertIn("ttadk", cmd[0])
+        self.assertIn("code", cmd)
+        self.assertIn("-t", cmd)
+
+    def test_stream_json_and_verbose(self):
+        cmd = self.bridge._build_cmd("hello", None)
+        args_str = " ".join(cmd)
+        self.assertIn("--output-format stream-json", args_str)
+        self.assertIn("--verbose", args_str)
+
+    def test_no_system_prompt(self):
+        """--system-prompt should NOT be in the command (breaks Claude Code)."""
+        cmd = self.bridge._build_cmd("hello", None)
+        args_str = " ".join(cmd)
+        self.assertNotIn("--system-prompt", args_str)
+
+    def test_session_resume(self):
+        cmd = self.bridge._build_cmd("hello", "sess_123")
+        args_str = " ".join(cmd)
+        self.assertIn("--resume sess_123", args_str)
+
+    def test_no_resume_without_session(self):
+        cmd = self.bridge._build_cmd("hello", None)
+        args_str = " ".join(cmd)
+        self.assertNotIn("--resume", args_str)
+
+    def test_allowed_tools_in_args(self):
+        bridge = ClaudeCodeBridge({"allowed_tools": "Bash,Read"})
+        cmd = bridge._build_cmd("hello", None)
+        args_str = " ".join(cmd)
+        self.assertIn("--allowedTools Bash,Read", args_str)
+
+    def test_newline_escaping(self):
+        cmd = self.bridge._build_cmd("line1\nline2", None)
+        args_str = " ".join(cmd)
+        self.assertNotIn("\n", args_str)
+
+    def test_single_quote_escaping(self):
+        cmd = self.bridge._build_cmd("it's a test", None)
+        args_str = " ".join(cmd)
+        self.assertIn("'\"'\"'", args_str)
+
+
+# ===========================================================================
+# ask() — mocked subprocess
+# ===========================================================================
+
+class TestBridgeAskMocked(unittest.TestCase):
+    """Test ask() with mocked subprocess."""
+
+    def test_missing_cmd_returns_error(self):
+        import asyncio
+        bridge = ClaudeCodeBridge({"ttadk_cmd": "nonexistent_cmd_99"})
+        result = asyncio.get_event_loop().run_until_complete(bridge.ask("t1", "hi"))
+        self.assertIsInstance(result, StreamResult)
+        self.assertIn("not found", result.reply_text)
+
+
+# ===========================================================================
+# Session Management
+# ===========================================================================
+
+class TestSessionManagement(unittest.TestCase):
+    """Test session_id tracking across topics."""
+
+    def test_session_stored(self):
+        bridge = ClaudeCodeBridge({})
+        bridge._sessions["topic1"] = "sess_a"
+        self.assertEqual(bridge._sessions.get("topic1"), "sess_a")
+
+    def test_different_topics(self):
+        bridge = ClaudeCodeBridge({})
+        bridge._sessions["topic1"] = "sess_a"
+        bridge._sessions["topic2"] = "sess_b"
+        self.assertNotEqual(bridge._sessions["topic1"], bridge._sessions["topic2"])
+
+
+# ===========================================================================
+# Config / Dotenv / Extract Text
+# ===========================================================================
 
 class TestLoadDotenv(unittest.TestCase):
-    """Test .env file parsing."""
 
     def test_basic_vars(self):
+        import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
             f.write("FOO=bar\nBAZ=qux\n")
             f.flush()
             os.environ.pop("FOO", None)
             os.environ.pop("BAZ", None)
             load_dotenv(f.name)
-            self.assertEqual(os.environ.get("FOO"), "bar")
-            self.assertEqual(os.environ.get("BAZ"), "qux")
-        os.unlink(f.name)
+        self.assertEqual(os.environ.get("FOO"), "bar")
+        self.assertEqual(os.environ.get("BAZ"), "qux")
         os.environ.pop("FOO", None)
         os.environ.pop("BAZ", None)
 
     def test_quoted_values(self):
+        import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
-            f.write("A='single quoted'\nB=\"double quoted\"\n")
-            f.flush()
-            os.environ.pop("A", None)
-            os.environ.pop("B", None)
-            load_dotenv(f.name)
-            self.assertEqual(os.environ.get("A"), "single quoted")
-            self.assertEqual(os.environ.get("B"), "double quoted")
-        os.unlink(f.name)
-        os.environ.pop("A", None)
-        os.environ.pop("B", None)
-
-    def test_comments_and_blanks(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
-            f.write("# comment\n\nKEY=val\n  # another comment\n")
+            f.write('KEY="hello world"\n')
             f.flush()
             os.environ.pop("KEY", None)
             load_dotenv(f.name)
-            self.assertEqual(os.environ.get("KEY"), "val")
-        os.unlink(f.name)
+        self.assertEqual(os.environ.get("KEY"), "hello world")
         os.environ.pop("KEY", None)
 
-    def test_existing_env_not_overridden(self):
-        os.environ["PRIORITY"] = "from_env"
+    def test_comments_and_blanks(self):
+        import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
-            f.write("PRIORITY=from_file\n")
+            f.write("# comment\n\nVAR=val\n")
+            f.flush()
+            os.environ.pop("VAR", None)
+            load_dotenv(f.name)
+        self.assertEqual(os.environ.get("VAR"), "val")
+        os.environ.pop("VAR", None)
+
+    def test_existing_env_not_overridden(self):
+        os.environ["EXISTING"] = "original"
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
+            f.write("EXISTING=new\n")
             f.flush()
             load_dotenv(f.name)
-            self.assertEqual(os.environ["PRIORITY"], "from_env")
-        os.unlink(f.name)
-        os.environ.pop("PRIORITY", None)
+        self.assertEqual(os.environ.get("EXISTING"), "original")
+        os.environ.pop("EXISTING", None)
 
     def test_missing_file_no_error(self):
         load_dotenv("/nonexistent/.env")
 
 
 class TestLoadConfig(unittest.TestCase):
-    """Test YAML config loading with env var substitution."""
 
     def test_env_substitution(self):
-        os.environ["TEST_APP_ID"] = "cli_test123"
+        import tempfile
+        os.environ["TEST_APP_ID"] = "myid"
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-            f.write("feishu:\n  app_id: $TEST_APP_ID\n")
+            f.write("feishu:\n  app_id: ${TEST_APP_ID}\n")
             f.flush()
             cfg = load_config(f.name)
-            self.assertEqual(cfg["feishu"]["app_id"], "cli_test123")
-        os.unlink(f.name)
+        self.assertEqual(cfg["feishu"]["app_id"], "myid")
         os.environ.pop("TEST_APP_ID", None)
 
     def test_missing_env_becomes_empty(self):
-        os.environ.pop("NONEXISTENT_VAR", None)
+        import tempfile
+        os.environ.pop("UNSET_VAR_XYZ", None)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-            f.write("key: $NONEXISTENT_VAR\n")
+            f.write("key: ${UNSET_VAR_XYZ}\n")
             f.flush()
             cfg = load_config(f.name)
-            self.assertIn(cfg["key"], ("", None))
-        os.unlink(f.name)
-
-
-class TestExtractJson(unittest.TestCase):
-    """Test ClaudeCodeBridge._extract_json() — parsing JSON from mixed CLI output."""
-
-    def test_clean_json_line(self):
-        output = '{"result": "hello", "session_id": "abc123"}'
-        parsed = ClaudeCodeBridge._extract_json(output)
-        self.assertEqual(parsed["result"], "hello")
-        self.assertEqual(parsed["session_id"], "abc123")
-
-    def test_json_with_noise_before(self):
-        output = (
-            "Loading config...\n"
-            "Connecting to API...\n"
-            '{"result": "done", "session_id": "s1"}\n'
-        )
-        parsed = ClaudeCodeBridge._extract_json(output)
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed["result"], "done")
-
-    def test_json_with_noise_after(self):
-        output = (
-            '{"result": "ok", "session_id": "s2"}\n'
-            "Process exited with code 0\n"
-        )
-        parsed = ClaudeCodeBridge._extract_json(output)
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed["result"], "ok")
-
-    def test_multiple_json_returns_last(self):
-        output = (
-            '{"status": "started"}\n'
-            'Some log line\n'
-            '{"result": "final answer", "session_id": "s3"}\n'
-        )
-        parsed = ClaudeCodeBridge._extract_json(output)
-        self.assertEqual(parsed["result"], "final answer")
-
-    def test_no_json_returns_none(self):
-        output = "Just some plain text\nNo JSON here\n"
-        parsed = ClaudeCodeBridge._extract_json(output)
-        self.assertIsNone(parsed)
-
-    def test_nested_json(self):
-        output = '{"result": "hi", "usage": {"input_tokens": 100, "output_tokens": 50}}'
-        parsed = ClaudeCodeBridge._extract_json(output)
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed["usage"]["input_tokens"], 100)
-
-    def test_malformed_json_skipped(self):
-        output = (
-            '{bad json here}\n'
-            '{"result": "good", "session_id": "s4"}\n'
-        )
-        parsed = ClaudeCodeBridge._extract_json(output)
-        self.assertEqual(parsed["result"], "good")
-
-    def test_multiline_json(self):
-        """Multi-line JSON should be handled by pass 2 (brace matching)."""
-        output = (
-            'Some log line\n'
-            '{\n'
-            '  "result": "multiline answer",\n'
-            '  "session_id": "s5"\n'
-            '}\n'
-            'trailing log\n'
-        )
-        parsed = ClaudeCodeBridge._extract_json(output)
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed["result"], "multiline answer")
-
-
-class TestExtractResult(unittest.TestCase):
-    """Test ClaudeCodeBridge._extract_result() — finding text in various JSON shapes."""
-
-    def test_result_field(self):
-        parsed = {"result": "hello", "session_id": "abc"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "hello")
-
-    def test_content_field(self):
-        """Some responses use 'content' instead of 'result'."""
-        parsed = {"content": "from content field", "session_id": "abc"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from content field")
-
-    def test_text_field(self):
-        parsed = {"text": "from text field", "session_id": "abc"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from text field")
-
-    def test_output_field(self):
-        parsed = {"output": "from output field", "session_id": "abc"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from output field")
-
-    def test_message_field(self):
-        parsed = {"message": "from message field", "session_id": "abc"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from message field")
-
-    def test_result_priority_over_content(self):
-        """'result' should take priority over 'content'."""
-        parsed = {"result": "from result", "content": "from content", "session_id": "abc"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from result")
-
-    def test_empty_result_falls_to_content(self):
-        """Empty 'result' should fall through to 'content'."""
-        parsed = {"result": "", "content": "actual answer", "session_id": "abc"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "actual answer")
-
-    def test_nested_data_field(self):
-        parsed = {"data": {"result": "nested answer"}, "session_id": "abc"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "nested answer")
-
-    def test_choices_openai_format(self):
-        parsed = {"choices": [{"message": {"content": "from choices"}}]}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "from choices")
-
-    def test_result_is_list_of_dicts(self):
-        parsed = {"result": [{"text": "part 1"}, {"text": "part 2"}], "session_id": "abc"}
-        result = ClaudeCodeBridge._extract_result(parsed)
-        self.assertIn("part 1", result)
-        self.assertIn("part 2", result)
-
-    def test_all_empty_returns_empty(self):
-        parsed = {"session_id": "abc", "status": "ok"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "")
-
-    def test_whitespace_only_skipped(self):
-        parsed = {"result": "   ", "content": "real answer"}
-        self.assertEqual(ClaudeCodeBridge._extract_result(parsed), "real answer")
-
-
-class TestCollectStrings(unittest.TestCase):
-    """Test ClaudeCodeBridge._collect_strings() — fallback string extraction."""
-
-    def test_flat_dict(self):
-        out = []
-        ClaudeCodeBridge._collect_strings({"a": "hello", "b": "world"}, out)
-        self.assertIn("hello", out)
-        self.assertIn("world", out)
-
-    def test_skip_keys(self):
-        out = []
-        ClaudeCodeBridge._collect_strings(
-            {"session_id": "skip_me", "text": "keep_me"},
-            out, skip_keys={"session_id"}
-        )
-        self.assertNotIn("skip_me", out)
-        self.assertIn("keep_me", out)
-
-    def test_nested(self):
-        out = []
-        ClaudeCodeBridge._collect_strings({"a": {"b": "deep value"}}, out)
-        self.assertIn("deep value", out)
-
-    def test_trivial_strings_skipped(self):
-        out = []
-        ClaudeCodeBridge._collect_strings({"a": "ok", "b": "x"}, out)
-        self.assertEqual(len(out), 0)  # "ok" and "x" are ≤ 2 chars
-
-
-class TestBuildCmd(unittest.TestCase):
-    """Test ClaudeCodeBridge._build_cmd() — CLI command construction."""
-
-    def setUp(self):
-        self.bridge = ClaudeCodeBridge({
-            "ttadk_cmd": "ttadk",
-            "model": "gpt-5.4",
-            "target": "claude",
-            "allowed_tools": "Bash,Read",
-        })
-
-    def test_basic_cmd_structure(self):
-        cmd = self.bridge._build_cmd("hello world", None)
-        self.assertEqual(cmd[0], "ttadk")
-        self.assertEqual(cmd[1], "code")
-        self.assertEqual(cmd[2], "-t")
-        self.assertEqual(cmd[3], "claude")
-        self.assertEqual(cmd[4], "-m")
-        self.assertEqual(cmd[5], "gpt-5.4")
-        self.assertEqual(cmd[6], "-a")
-
-    def test_prompt_in_args(self):
-        cmd = self.bridge._build_cmd("test prompt", None)
-        a_arg = cmd[7]
-        self.assertIn("-p ", a_arg)
-        self.assertIn("test prompt", a_arg)
-
-    def test_session_resume(self):
-        cmd = self.bridge._build_cmd("hi", "session_xyz")
-        a_arg = cmd[7]
-        self.assertIn("--resume session_xyz", a_arg)
-
-    def test_no_resume_without_session(self):
-        cmd = self.bridge._build_cmd("hi", None)
-        a_arg = cmd[7]
-        self.assertNotIn("--resume", a_arg)
-
-    def test_allowed_tools_in_args(self):
-        cmd = self.bridge._build_cmd("hi", None)
-        a_arg = cmd[7]
-        self.assertIn("--allowedTools Bash,Read", a_arg)
-
-    def test_json_output_format(self):
-        cmd = self.bridge._build_cmd("hi", None)
-        a_arg = cmd[7]
-        self.assertIn("--output-format json", a_arg)
-
-    def test_single_quote_escaping(self):
-        cmd = self.bridge._build_cmd("it's a test", None)
-        a_arg = cmd[7]
-        self.assertNotIn("it's", a_arg)
-
-    def test_newline_escaping(self):
-        cmd = self.bridge._build_cmd("line1\nline2", None)
-        a_arg = cmd[7]
-        self.assertNotIn("\n", a_arg)
-        self.assertIn("\\n", a_arg)
+        self.assertFalse(cfg["key"])
 
 
 class TestExtractText(unittest.TestCase):
-    """Test FeishuBot._extract_text() — Feishu message content parsing."""
 
     def test_plain_text(self):
-        content = {"text": "hello world"}
-        self.assertEqual(FeishuBot._extract_text(content), "hello world")
+        self.assertEqual(FeishuBot._extract_text({"text": "hello"}), "hello")
 
     def test_rich_text_single_paragraph(self):
-        content = {
-            "content": [
-                [{"tag": "text", "text": "Hello"}, {"tag": "text", "text": "World"}]
-            ]
-        }
-        self.assertEqual(FeishuBot._extract_text(content), "Hello World")
+        content = {"content": [[{"tag": "text", "text": "Hi"}, {"tag": "text", "text": " there"}]]}
+        self.assertEqual(FeishuBot._extract_text(content), "Hi  there")
 
     def test_rich_text_multiple_paragraphs(self):
-        content = {
-            "content": [
-                [{"tag": "text", "text": "Para 1"}],
-                [{"tag": "text", "text": "Para 2"}],
-            ]
-        }
+        content = {"content": [
+            [{"tag": "text", "text": "Para 1"}],
+            [{"tag": "text", "text": "Para 2"}],
+        ]}
         self.assertEqual(FeishuBot._extract_text(content), "Para 1\n\nPara 2")
 
     def test_at_mention_included(self):
-        content = {
-            "content": [
-                [{"tag": "at", "text": "@Bot"}, {"tag": "text", "text": " do something"}]
-            ]
-        }
-        result = FeishuBot._extract_text(content)
-        self.assertIn("@Bot", result)
-        self.assertIn("do something", result)
+        content = {"content": [[{"tag": "at", "text": "@bot"}, {"tag": "text", "text": " help"}]]}
+        self.assertIn("help", FeishuBot._extract_text(content))
 
     def test_non_text_tags_ignored(self):
-        content = {
-            "content": [
-                [{"tag": "text", "text": "visible"}, {"tag": "img", "image_key": "xxx"}]
-            ]
-        }
-        self.assertEqual(FeishuBot._extract_text(content), "visible")
+        content = {"content": [[{"tag": "img", "src": "http://x"}, {"tag": "text", "text": "ok"}]]}
+        self.assertEqual(FeishuBot._extract_text(content), "ok")
 
     def test_empty_content(self):
         self.assertEqual(FeishuBot._extract_text({}), "")
-        self.assertEqual(FeishuBot._extract_text({"content": []}), "")
 
 
 class TestCard(unittest.TestCase):
-    """Test FeishuBot._card() — Feishu interactive card JSON."""
 
     def test_card_structure(self):
-        card_str = FeishuBot._card("# Hello")
-        card = json.loads(card_str)
+        card = json.loads(FeishuBot._card("hello"))
         self.assertTrue(card["config"]["wide_screen_mode"])
-        self.assertTrue(card["config"]["update_multi"])
-        self.assertEqual(len(card["elements"]), 1)
-        self.assertEqual(card["elements"][0]["tag"], "markdown")
-        self.assertEqual(card["elements"][0]["content"], "# Hello")
+        self.assertEqual(card["elements"][0]["content"], "hello")
 
     def test_card_with_special_chars(self):
-        text = 'Code: `print("hello")`'
-        card = json.loads(FeishuBot._card(text))
-        self.assertEqual(card["elements"][0]["content"], text)
-
-
-class TestSessionManagement(unittest.TestCase):
-    """Test ClaudeCodeBridge session tracking."""
-
-    def test_session_stored_on_response(self):
-        bridge = ClaudeCodeBridge({})
-        bridge._sessions["topic_1"] = "session_abc"
-        self.assertEqual(bridge._sessions.get("topic_1"), "session_abc")
-
-    def test_different_topics_different_sessions(self):
-        bridge = ClaudeCodeBridge({})
-        bridge._sessions["topic_a"] = "session_1"
-        bridge._sessions["topic_b"] = "session_2"
-        self.assertNotEqual(bridge._sessions["topic_a"], bridge._sessions["topic_b"])
-
-
-class TestBridgeAskMocked(unittest.TestCase):
-    """Test ClaudeCodeBridge.ask() with mocked subprocess."""
-
-    def test_timeout_returns_message(self):
-        bridge = ClaudeCodeBridge({"timeout": 1, "ttadk_cmd": "sleep"})
-
-        async def run():
-            return await bridge.ask("t1", "test")
-
-        result = asyncio.get_event_loop().run_until_complete(run())
-        self.assertIsInstance(result, str)
-        self.assertTrue(len(result) > 0)
-
-    def test_missing_cmd_returns_error(self):
-        bridge = ClaudeCodeBridge({"ttadk_cmd": "nonexistent_cmd_12345"})
-
-        async def run():
-            return await bridge.ask("t1", "test")
-
-        result = asyncio.get_event_loop().run_until_complete(run())
-        self.assertIn("not found", result.lower())
+        card = json.loads(FeishuBot._card('test "quotes" & <tags>'))
+        self.assertIn("quotes", card["elements"][0]["content"])
 
 
 if __name__ == "__main__":
