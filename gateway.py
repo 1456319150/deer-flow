@@ -354,6 +354,7 @@ class FeishuBot:
             handler = (
                 lark.EventDispatcherHandler.builder("", "")
                 .register_p2_im_message_receive_v1(self._on_message)
+                .register_p2_im_message_reaction_created_v1(lambda e: None)
                 .build()
             )
             ws = lark.ws.Client(
