@@ -552,10 +552,6 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         bot.bridge.stream_ask = fake_stream_ask
         bot._reply_card = AsyncMock(return_value="card_1")
-<<<<<<< HEAD
-=======
-        bot._update_card = AsyncMock()
->>>>>>> origin/main
         bot._react = AsyncMock()
 
         await bot._handle("chat", "msg", "topic", "hello")
@@ -566,10 +562,6 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🔧 Tool Use: Bash", rendered_contents[1])
         self.assertIn("📦 Tool Result: Bash", rendered_contents[2])
         self.assertEqual("最终回复", rendered_contents[3])
-<<<<<<< HEAD
-=======
-        bot._update_card.assert_not_called()
->>>>>>> origin/main
         self.assertEqual(bot._react.await_count, 2)
 
     async def test_handle_skips_duplicate_result_event(self):
@@ -583,20 +575,12 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         bot.bridge.stream_ask = fake_stream_ask
         bot._reply_card = AsyncMock(return_value="card_1")
-<<<<<<< HEAD
-=======
-        bot._update_card = AsyncMock()
->>>>>>> origin/main
         bot._react = AsyncMock()
 
         await bot._handle("chat", "msg", "topic", "hello")
 
         self.assertEqual(bot._reply_card.await_count, 1)
         self.assertNotIn("✅ Result", bot._reply_card.await_args.args[1])
-<<<<<<< HEAD
-=======
-        bot._update_card.assert_not_called()
->>>>>>> origin/main
 
     async def test_handle_without_stream_text_appends_final_reply(self):
         bridge = ClaudeCodeBridge({})
@@ -608,10 +592,6 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         bot.bridge.stream_ask = fake_stream_ask
         bot._reply_card = AsyncMock(return_value="card_1")
-<<<<<<< HEAD
-=======
-        bot._update_card = AsyncMock()
->>>>>>> origin/main
         bot._react = AsyncMock()
 
         await bot._handle("chat", "msg", "topic", "hello")
@@ -619,10 +599,6 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
         self.assertIn("🔧 Tool Use: Bash", rendered_contents[0])
         self.assertIn("已推送到 origin/main", rendered_contents[-1])
-<<<<<<< HEAD
-=======
-        bot._update_card.assert_not_called()
->>>>>>> origin/main
 
     async def test_handle_without_stream_events_falls_back_to_final_result(self):
         bridge = ClaudeCodeBridge({})
@@ -633,20 +609,12 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         bot.bridge.stream_ask = fake_stream_ask
         bot._reply_card = AsyncMock(return_value="card_1")
-<<<<<<< HEAD
-=======
-        bot._update_card = AsyncMock()
->>>>>>> origin/main
         bot._react = AsyncMock()
 
         await bot._handle("chat", "msg", "topic", "hello")
 
         bot._reply_card.assert_awaited_once()
         self.assertIn("🔧 Tool Calls", bot._reply_card.await_args.args[1])
-<<<<<<< HEAD
-=======
-        bot._update_card.assert_not_called()
->>>>>>> origin/main
 
 
 class TestLoadDotenv(unittest.TestCase):
