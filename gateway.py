@@ -79,6 +79,14 @@ def _reset_log_file(path: str) -> None:
         pass
 
 
+def _get_initial_message() -> tuple[str, str] | None:
+    topic_id = os.environ.get("GATEWAY_INITIAL_TOPIC_ID", "").strip()
+    prompt = os.environ.get("GATEWAY_INITIAL_PROMPT", "").strip()
+    if not topic_id or not prompt:
+        return None
+    return topic_id, prompt
+
+
 # ===========================================================================
 # Stream Result
 # ===========================================================================
@@ -246,6 +254,20 @@ class ClaudeCodeBridge:
             "event": StreamEvent(kind=kind, text=text, tool_name=tool_name, tool_use_id=tool_use_id),
         })
 
+    @staticmethod
+    def _stringify_tool_result_content(content_val: Any) -> str:
+        if isinstance(content_val, list):
+            parts = []
+            for item in content_val:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(parts).strip()
+        if isinstance(content_val, str):
+            return content_val.strip()
+        return str(content_val).strip()
+
     @classmethod
     def _consume_event(cls, state: StreamState, event: dict[str, Any]) -> list[dict[str, Any]]:
         emitted: list[dict[str, Any]] = []
@@ -295,25 +317,26 @@ class ClaudeCodeBridge:
 
                 elif block_type == "tool_result":
                     tool_use_id = block.get("tool_use_id", "")
-                    content_val = block.get("content", "")
-                    if isinstance(content_val, list):
-                        parts = []
-                        for item in content_val:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                parts.append(item.get("text", ""))
-                            elif isinstance(item, str):
-                                parts.append(item)
-                        output = "\n".join(parts)
-                    elif isinstance(content_val, str):
-                        output = content_val
-                    else:
-                        output = str(content_val)
-                    output = output.strip()
+                    output = cls._stringify_tool_result_content(block.get("content", ""))
                     tool_name = ""
                     if tool_use_id in state.pending_tools:
                         state.pending_tools[tool_use_id].output_text = output
                         tool_name = state.pending_tools[tool_use_id].name
                     cls._emit_stream_event(emitted, "tool_result", text=output, tool_name=tool_name, tool_use_id=tool_use_id)
+
+        elif event_type == "user":
+            message = event.get("message", {})
+            content = message.get("content", [])
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = block.get("tool_use_id", "")
+                output = cls._stringify_tool_result_content(block.get("content", ""))
+                tool_name = ""
+                if tool_use_id in state.pending_tools:
+                    state.pending_tools[tool_use_id].output_text = output
+                    tool_name = state.pending_tools[tool_use_id].name
+                cls._emit_stream_event(emitted, "tool_result", text=output, tool_name=tool_name, tool_use_id=tool_use_id)
 
         elif event_type == "system" and event.get("subtype") == "init":
             session_id = event.get("session_id")
@@ -415,6 +438,16 @@ async def main() -> None:
     bridge = ClaudeCodeBridge(cfg.get("claude", {}))
 
     log.info("[Init] file logging enabled at %s", log_path)
+
+    initial_message = _get_initial_message()
+    if initial_message:
+        initial_topic_id, initial_prompt = initial_message
+        log.info("[Init] sending initial prompt to topic=%s prompt=%r", initial_topic_id, _preview_text(initial_prompt))
+        result = await bridge.ask(initial_topic_id, initial_prompt)
+        if result.reply_text:
+            log.info("[Init] initial reply: %s", _preview_text(result.reply_text))
+        else:
+            log.info("[Init] initial prompt finished with empty reply")
 
     # Feishu channel
     from feishu_bot import FeishuBot

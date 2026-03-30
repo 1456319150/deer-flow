@@ -4,7 +4,9 @@ import asyncio
 import json
 import os
 import tempfile
+import types
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from feishu_bot import FeishuBot
@@ -14,10 +16,12 @@ from gateway import (
     StreamResult,
     StreamState,
     ToolCall,
+    _get_initial_message,
     _preview_text,
     _reset_log_file,
     load_config,
     load_dotenv,
+    main,
 )
 
 
@@ -142,7 +146,7 @@ class TestParseStream(unittest.TestCase):
                 {"type": "tool_use", "id": "tool_1", "name": "Bash",
                  "input": {"command": "echo hi"}}
             ]}},
-            {"type": "assistant", "message": {"content": [
+            {"type": "user", "message": {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "tool_1",
                  "content": "hi"}
             ]}}
@@ -157,13 +161,27 @@ class TestParseStream(unittest.TestCase):
                 {"type": "tool_use", "id": "t1", "name": "Bash",
                  "input": {"command": "cat file.txt"}}
             ]}},
-            {"type": "assistant", "message": {"content": [
+            {"type": "user", "message": {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1",
                  "content": [{"type": "text", "text": "line1"}, {"type": "text", "text": "line2"}]}
             ]}}
         )
         result = ClaudeCodeBridge._parse_stream(raw)
         self.assertEqual(result.tool_calls[0].output_text, "line1\nline2")
+
+    def test_tool_result_assistant_event_still_supported(self):
+        raw = self._build_stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tool_legacy", "name": "Bash",
+                 "input": {"command": "echo hi"}}
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tool_legacy",
+                 "content": "hi"}
+            ]}}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.tool_calls[0].output_text, "hi")
 
     def test_full_workflow(self):
         """Full realistic stream: system → thinking → tool_use → tool_result → text → result."""
@@ -451,7 +469,7 @@ class TestStreamingHelpers(unittest.TestCase):
         self.assertEqual([event["event"].kind for event in events], ["thinking", "tool_use"])
         result_events = ClaudeCodeBridge._consume_stream_line(
             state,
-            json.dumps({"type": "assistant", "message": {"content": [{
+            json.dumps({"type": "user", "message": {"role": "user", "content": [{
                 "type": "tool_result", "tool_use_id": "t1", "content": "repo"
             }]}}),
         )
@@ -539,29 +557,34 @@ class TestSessionManagement(unittest.TestCase):
 
 class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
-    async def test_handle_stream_events_reply_one_card_per_event(self):
+    async def test_handle_stream_events_merge_tool_result_into_tool_use_card(self):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
         async def fake_stream_ask(topic_id, prompt):
             yield {"type": "stream_event", "event": StreamEvent(kind="thinking", text="先思考")}
-            yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Bash", text="pwd")}
-            yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Bash", text="/repo")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Bash", tool_use_id="t1", text="pwd")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Bash", tool_use_id="t1", text="/repo")}
             yield {"type": "stream_event", "event": StreamEvent(kind="text", text="最终回复")}
             yield {"type": "final", "result": StreamResult(assistant_texts=["最终回复"])}
 
         bot.bridge.stream_ask = fake_stream_ask
-        bot._reply_card = AsyncMock(return_value="card_1")
+        bot._reply_card = AsyncMock(side_effect=["card-thinking", "card-tool", "card-text"])
+        bot._update_card = AsyncMock()
         bot._react = AsyncMock()
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        self.assertEqual(bot._reply_card.await_count, 4)
+        self.assertEqual(bot._reply_card.await_count, 3)
         rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
         self.assertIn("💭 Thinking", rendered_contents[0])
         self.assertIn("🔧 Tool Use: Bash", rendered_contents[1])
-        self.assertIn("📦 Tool Result: Bash", rendered_contents[2])
-        self.assertEqual("最终回复", rendered_contents[3])
+        self.assertEqual("最终回复", rendered_contents[2])
+        bot._update_card.assert_awaited_once()
+        self.assertEqual(bot._update_card.await_args.args[0], "card-tool")
+        merged_content = bot._update_card.await_args.args[1]
+        self.assertIn("🔧 Tool Use: Bash", merged_content)
+        self.assertIn("📦 Tool Result: Bash", merged_content)
         self.assertEqual(bot._react.await_count, 2)
 
     async def test_handle_skips_duplicate_result_event(self):
@@ -615,6 +638,13 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         bot._reply_card.assert_awaited_once()
         self.assertIn("🔧 Tool Calls", bot._reply_card.await_args.args[1])
+
+    def test_remember_current_topic_persists_latest_topic(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            topic_path = Path(temp_dir) / "current_feishu_topic.txt"
+            with patch.object(FeishuBot, "CURRENT_TOPIC_PATH", topic_path):
+                FeishuBot._remember_current_topic("topic-123")
+            self.assertEqual(topic_path.read_text(encoding="utf-8"), "topic-123\n")
 
 
 class TestLoadDotenv(unittest.TestCase):
@@ -686,6 +716,99 @@ class TestLoadConfig(unittest.TestCase):
             f.flush()
             cfg = load_config(f.name)
         self.assertFalse(cfg["key"])
+
+
+class TestInitialMessage(unittest.TestCase):
+
+    def test_get_initial_message_requires_both_values(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GATEWAY_INITIAL_TOPIC_ID", None)
+            os.environ.pop("GATEWAY_INITIAL_PROMPT", None)
+            self.assertIsNone(_get_initial_message())
+
+            os.environ["GATEWAY_INITIAL_TOPIC_ID"] = "topic-1"
+            self.assertIsNone(_get_initial_message())
+
+            os.environ.pop("GATEWAY_INITIAL_TOPIC_ID", None)
+            os.environ["GATEWAY_INITIAL_PROMPT"] = "hello"
+            self.assertIsNone(_get_initial_message())
+
+    def test_get_initial_message_returns_stripped_values(self):
+        with patch.dict(os.environ, {
+            "GATEWAY_INITIAL_TOPIC_ID": "  topic-1  ",
+            "GATEWAY_INITIAL_PROMPT": "  hello world  ",
+        }, clear=False):
+            self.assertEqual(_get_initial_message(), ("topic-1", "hello world"))
+
+
+class TestGatewayMain(unittest.IsolatedAsyncioTestCase):
+
+    async def test_main_sends_initial_prompt_before_starting_channels(self):
+        cfg = {
+            "claude": {},
+            "feishu": {"app_id": "app", "app_secret": "secret"},
+            "weixin": {"enabled": False},
+        }
+        events: list[str] = []
+        bridge = AsyncMock()
+        bridge.ask = AsyncMock(side_effect=lambda topic, prompt: events.append(f"ask:{topic}:{prompt}") or StreamResult(assistant_texts=["ok"]))
+
+        class FakeFeishuBot:
+            def __init__(self, feishu_cfg, bridge_obj):
+                self.feishu_cfg = feishu_cfg
+                self.bridge_obj = bridge_obj
+
+            async def start(self):
+                events.append("feishu_start")
+
+        fake_feishu_module = types.SimpleNamespace(FeishuBot=FakeFeishuBot)
+
+        with (
+            patch("gateway.load_config", return_value=cfg),
+            patch("gateway.ClaudeCodeBridge", return_value=bridge),
+            patch.dict(os.environ, {
+                "GATEWAY_INITIAL_TOPIC_ID": "topic-1",
+                "GATEWAY_INITIAL_PROMPT": "restart-and-continue",
+            }, clear=False),
+            patch.dict(os.sys.modules, {"feishu_bot": fake_feishu_module}),
+            patch("asyncio.Event.wait", new=AsyncMock(side_effect=asyncio.CancelledError)),
+        ):
+            await main()
+
+        self.assertEqual(events, ["ask:topic-1:restart-and-continue", "feishu_start"])
+        bridge.ask.assert_awaited_once_with("topic-1", "restart-and-continue")
+
+    async def test_main_skips_initial_prompt_when_missing(self):
+        cfg = {
+            "claude": {},
+            "feishu": {"app_id": "app", "app_secret": "secret"},
+            "weixin": {"enabled": False},
+        }
+        bridge = AsyncMock()
+        bridge.ask = AsyncMock()
+
+        class FakeFeishuBot:
+            def __init__(self, feishu_cfg, bridge_obj):
+                self.feishu_cfg = feishu_cfg
+                self.bridge_obj = bridge_obj
+
+            async def start(self):
+                pass
+
+        fake_feishu_module = types.SimpleNamespace(FeishuBot=FakeFeishuBot)
+
+        with (
+            patch("gateway.load_config", return_value=cfg),
+            patch("gateway.ClaudeCodeBridge", return_value=bridge),
+            patch.dict(os.environ, {}, clear=False),
+            patch.dict(os.sys.modules, {"feishu_bot": fake_feishu_module}),
+            patch("asyncio.Event.wait", new=AsyncMock(side_effect=asyncio.CancelledError)),
+        ):
+            os.environ.pop("GATEWAY_INITIAL_TOPIC_ID", None)
+            os.environ.pop("GATEWAY_INITIAL_PROMPT", None)
+            await main()
+
+        bridge.ask.assert_not_called()
 
 
 class TestExtractText(unittest.TestCase):

@@ -14,6 +14,7 @@ import json
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from gateway import ClaudeCodeBridge, StreamResult, StreamEvent, _preview_text
@@ -23,6 +24,8 @@ log = logging.getLogger("feishu")
 
 class FeishuBot:
     """Feishu WebSocket bot with card-based responses."""
+
+    CURRENT_TOPIC_PATH = Path(".run/current_feishu_topic.txt")
 
     # Truncation limits
     MAX_REPLY = 50000
@@ -132,6 +135,8 @@ class FeishuBot:
             if not text:
                 return
 
+            self._remember_current_topic(topic_id)
+
             if self._main_loop and self._main_loop.is_running():
                 fut = asyncio.run_coroutine_threadsafe(
                     self._handle(chat_id, msg_id, topic_id, text), self._main_loop
@@ -141,11 +146,12 @@ class FeishuBot:
             log.exception("Error processing message")
 
     async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
-        """Full message lifecycle: react → one card per event → done."""
+        """Full message lifecycle: react → stream cards → done."""
         await self._react(msg_id, "OK")
         result = StreamResult()
         emitted_blocks: list[str] = []
         streamed_texts: list[str] = []
+        tool_cards: dict[str, dict[str, str]] = {}
         saw_stream_event = False
 
         try:
@@ -166,6 +172,18 @@ class FeishuBot:
                         current_reply = "\n\n".join(streamed_texts).strip()
                         if not stream_event.text or stream_event.text == current_reply:
                             continue
+                    if stream_event.kind == "tool_result" and stream_event.tool_use_id in tool_cards:
+                        tool_card = tool_cards[stream_event.tool_use_id]
+                        merged = self._merge_tool_stream_blocks(tool_card["tool_use_block"], stream_event)
+                        if merged and merged != tool_card.get("content"):
+                            log.info(
+                                "[RenderCard] mode=update content_len=%d tool_use_id=%s",
+                                len(merged),
+                                stream_event.tool_use_id,
+                            )
+                            await self._update_card(tool_card["card_id"], merged)
+                            tool_card["content"] = merged
+                        continue
                     block = self._format_stream_event(stream_event)
                     if not block or block in emitted_blocks:
                         continue
@@ -176,7 +194,13 @@ class FeishuBot:
                         len(block),
                         stream_event.kind,
                     )
-                    await self._reply_card(msg_id, block)
+                    card_id = await self._reply_card(msg_id, block)
+                    if stream_event.kind == "tool_use" and stream_event.tool_use_id and card_id:
+                        tool_cards[stream_event.tool_use_id] = {
+                            "card_id": card_id,
+                            "tool_use_block": block,
+                            "content": block,
+                        }
                 elif event["type"] == "final":
                     result = event["result"]
         except Exception as e:
@@ -222,6 +246,15 @@ class FeishuBot:
                 text = text[:cls.MAX_REPLY] + "\n\n... (truncated, response too long)"
             return text
         return ""
+
+    @classmethod
+    def _merge_tool_stream_blocks(cls, tool_use_block: str, tool_result_event: StreamEvent) -> str:
+        result_block = cls._format_stream_event(tool_result_event)
+        if not tool_use_block:
+            return result_block
+        if not result_block:
+            return tool_use_block
+        return f"{tool_use_block}\n\n{result_block}"
 
     @classmethod
     def _format_stream_transcript(cls, blocks: list[str]) -> str:
@@ -372,6 +405,16 @@ class FeishuBot:
                         paras.append(joined)
             return "\n\n".join(paras)
         return ""
+
+    @classmethod
+    def _remember_current_topic(cls, topic_id: str) -> None:
+        if not topic_id:
+            return
+        try:
+            cls.CURRENT_TOPIC_PATH.parent.mkdir(parents=True, exist_ok=True)
+            cls.CURRENT_TOPIC_PATH.write_text(f"{topic_id}\n", encoding="utf-8")
+        except Exception:
+            log.debug("Remember current topic failed: %s", topic_id, exc_info=True)
 
     @staticmethod
     def _log_err(fut: Any, msg_id: str) -> None:
