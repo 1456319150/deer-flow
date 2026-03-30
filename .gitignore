@@ -3,3 +3,13 @@ __pycache__/
 .env
 *.egg-info/
 venv/
+.venv/
+.python-version
+logs/
+.vscode/
+.gateway-sessions.json
+
+# WeChat channel state
+.weixin-account.json
+.weixin-context-tokens.json
+.weixin-sync-cursor.json
