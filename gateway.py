@@ -517,17 +517,17 @@ class FeishuBot:
             log.exception("Error processing message")
 
     async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
-        """Full message lifecycle: react → incremental card updates → done."""
+        """Full message lifecycle: react → one card per event → done."""
         await self._react(msg_id, "OK")
-        card_id = await self._reply_card(msg_id, "🤔 Thinking...")
-        rendered_blocks: list[str] = []
-        streamed_texts: list[str] = []
-        seen_result_block = False
         result = StreamResult()
+        emitted_blocks: list[str] = []
+        streamed_texts: list[str] = []
+        saw_stream_event = False
 
         try:
             async for event in self.bridge.stream_ask(topic_id, text):
                 if event["type"] == "stream_event":
+                    saw_stream_event = True
                     stream_event = event["event"]
                     log.info(
                         "[RenderEvent] kind=%s tool=%s text_len=%d preview=%r",
@@ -541,59 +541,34 @@ class FeishuBot:
                     if stream_event.kind == "result":
                         current_reply = "\n\n".join(streamed_texts).strip()
                         if not stream_event.text or stream_event.text == current_reply:
-                            seen_result_block = True
                             continue
-                        seen_result_block = True
                     block = self._format_stream_event(stream_event)
-                    if not block:
+                    if not block or block in emitted_blocks:
                         continue
-                    rendered_blocks.append(block)
-                    content = self._format_stream_transcript(rendered_blocks)
+                    emitted_blocks.append(block)
                     log.info(
-                        "[RenderCard] blocks=%d content_len=%d last_kind=%s",
-                        len(rendered_blocks),
-                        len(content),
+                        "[RenderCard] mode=reply blocks=%d content_len=%d last_kind=%s",
+                        len(emitted_blocks),
+                        len(block),
                         stream_event.kind,
                     )
-                    if card_id:
-                        await self._update_card(card_id, content)
-                    else:
-                        card_id = await self._reply_card(msg_id, content)
+                    await self._reply_card(msg_id, block)
                 elif event["type"] == "final":
                     result = event["result"]
         except Exception as e:
             log.exception("Bridge error")
             result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
 
-        if not rendered_blocks:
+        if not saw_stream_event:
             card_content = self._format_result(result)
             log.info("[RenderFallback] content_len=%d", len(card_content))
-            if card_id:
-                await self._update_card(card_id, card_content)
-            else:
-                await self._reply_card(msg_id, card_content)
-        elif result.reply_text and not any(block == result.reply_text for block in rendered_blocks):
+            await self._reply_card(msg_id, card_content)
+        elif result.reply_text:
             final_text = result.reply_text
             reply_so_far = "\n\n".join(streamed_texts).strip()
-            if final_text != reply_so_far:
+            if final_text != reply_so_far and final_text not in emitted_blocks:
                 log.info("[RenderFinalText] text_len=%d preview=%r", len(final_text), _preview_text(final_text))
-                rendered_blocks.append(final_text)
-                content = self._format_stream_transcript(rendered_blocks)
-                if card_id:
-                    await self._update_card(card_id, content)
-                else:
-                    await self._reply_card(msg_id, content)
-        elif result.result_text and not seen_result_block:
-            final_block = self._format_stream_event(StreamEvent(kind="result", text=result.result_text))
-            if final_block:
-                reply_so_far = "\n\n".join(result.assistant_texts).strip()
-                if result.result_text != reply_so_far:
-                    rendered_blocks.append(final_block)
-                    content = self._format_stream_transcript(rendered_blocks)
-                    if card_id:
-                        await self._update_card(card_id, content)
-                    else:
-                        await self._reply_card(msg_id, content)
+                await self._reply_card(msg_id, final_text)
 
         await self._react(msg_id, "DONE")
 

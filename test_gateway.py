@@ -539,7 +539,7 @@ class TestSessionManagement(unittest.TestCase):
 
 class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
-    async def test_handle_stream_events_patch_same_card(self):
+    async def test_handle_stream_events_reply_one_card_per_event(self):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
@@ -557,13 +557,13 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        bot._reply_card.assert_called_once_with("msg", "🤔 Thinking...")
-        self.assertEqual(bot._update_card.await_count, 4)
-        final_content = bot._update_card.await_args_list[-1].args[1]
-        self.assertIn("💭 Thinking", final_content)
-        self.assertIn("🔧 Tool Use: Bash", final_content)
-        self.assertIn("📦 Tool Result: Bash", final_content)
-        self.assertIn("最终回复", final_content)
+        self.assertEqual(bot._reply_card.await_count, 4)
+        rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
+        self.assertIn("💭 Thinking", rendered_contents[0])
+        self.assertIn("🔧 Tool Use: Bash", rendered_contents[1])
+        self.assertIn("📦 Tool Result: Bash", rendered_contents[2])
+        self.assertEqual("最终回复", rendered_contents[3])
+        bot._update_card.assert_not_called()
         self.assertEqual(bot._react.await_count, 2)
 
     async def test_handle_skips_duplicate_result_event(self):
@@ -582,8 +582,9 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        self.assertEqual(bot._update_card.await_count, 1)
-        self.assertNotIn("✅ Result", bot._update_card.await_args.args[1])
+        self.assertEqual(bot._reply_card.await_count, 1)
+        self.assertNotIn("✅ Result", bot._reply_card.await_args.args[1])
+        bot._update_card.assert_not_called()
 
     async def test_handle_without_stream_text_appends_final_reply(self):
         bridge = ClaudeCodeBridge({})
@@ -600,9 +601,10 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        final_content = bot._update_card.await_args_list[-1].args[1]
-        self.assertIn("🔧 Tool Use: Bash", final_content)
-        self.assertIn("已推送到 origin/main", final_content)
+        rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
+        self.assertIn("🔧 Tool Use: Bash", rendered_contents[0])
+        self.assertIn("已推送到 origin/main", rendered_contents[-1])
+        bot._update_card.assert_not_called()
 
     async def test_handle_without_stream_events_falls_back_to_final_result(self):
         bridge = ClaudeCodeBridge({})
@@ -618,8 +620,9 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        bot._update_card.assert_awaited_once()
-        self.assertIn("🔧 Tool Calls", bot._update_card.await_args.args[1])
+        bot._reply_card.assert_awaited_once()
+        self.assertIn("🔧 Tool Calls", bot._reply_card.await_args.args[1])
+        bot._update_card.assert_not_called()
 
 
 class TestLoadDotenv(unittest.TestCase):
