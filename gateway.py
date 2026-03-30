@@ -399,6 +399,7 @@ async def main() -> None:
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "gateway.log")
+    _reset_log_file(log_path)
     handlers = [
         logging.StreamHandler(),
         logging.FileHandler(log_path, encoding="utf-8"),
