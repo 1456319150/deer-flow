@@ -15,6 +15,7 @@ from gateway import (
     StreamState,
     ToolCall,
     _preview_text,
+    _reset_log_file,
     load_config,
     load_dotenv,
 )
@@ -30,6 +31,15 @@ class TestStreamResult(unittest.TestCase):
     def test_preview_text_escapes_newlines_and_truncates(self):
         self.assertEqual(_preview_text("a\nb", limit=10), "a\\nb")
         self.assertEqual(_preview_text("123456", limit=4), "1234...")
+
+    def test_reset_log_file_truncates_existing_content(self):
+        with tempfile.NamedTemporaryFile("w+", delete=False) as f:
+            f.write("old log")
+            path = f.name
+        _reset_log_file(path)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "")
+        os.unlink(path)
 
     def test_reply_text_prefers_result(self):
         r = StreamResult(result_text="from result", assistant_texts=["from assistant"])
@@ -574,6 +584,25 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(bot._update_card.await_count, 1)
         self.assertNotIn("✅ Result", bot._update_card.await_args.args[1])
+
+    async def test_handle_without_stream_text_appends_final_reply(self):
+        bridge = ClaudeCodeBridge({})
+        bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
+
+        async def fake_stream_ask(topic_id, prompt):
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Bash", text="git push origin main")}
+            yield {"type": "final", "result": StreamResult(assistant_texts=["已推送到 origin/main"])}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        bot._reply_card = AsyncMock(return_value="card_1")
+        bot._update_card = AsyncMock()
+        bot._react = AsyncMock()
+
+        await bot._handle("chat", "msg", "topic", "hello")
+
+        final_content = bot._update_card.await_args_list[-1].args[1]
+        self.assertIn("🔧 Tool Use: Bash", final_content)
+        self.assertIn("已推送到 origin/main", final_content)
 
     async def test_handle_without_stream_events_falls_back_to_final_result(self):
         bridge = ClaudeCodeBridge({})

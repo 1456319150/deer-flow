@@ -76,6 +76,11 @@ def _preview_text(text: str, limit: int = 120) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _reset_log_file(path: str) -> None:
+    with open(path, "w", encoding="utf-8"):
+        pass
+
+
 # ===========================================================================
 # Stream Result
 # ===========================================================================
@@ -567,6 +572,17 @@ class FeishuBot:
                 await self._update_card(card_id, card_content)
             else:
                 await self._reply_card(msg_id, card_content)
+        elif result.reply_text and not any(block == result.reply_text for block in rendered_blocks):
+            final_text = result.reply_text
+            reply_so_far = "\n\n".join(streamed_texts).strip()
+            if final_text != reply_so_far:
+                log.info("[RenderFinalText] text_len=%d preview=%r", len(final_text), _preview_text(final_text))
+                rendered_blocks.append(final_text)
+                content = self._format_stream_transcript(rendered_blocks)
+                if card_id:
+                    await self._update_card(card_id, content)
+                else:
+                    await self._reply_card(msg_id, content)
         elif result.result_text and not seen_result_block:
             final_block = self._format_stream_event(StreamEvent(kind="result", text=result.result_text))
             if final_block:
@@ -775,6 +791,7 @@ async def main() -> None:
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "gateway.log")
+    _reset_log_file(log_path)
     handlers = [
         logging.StreamHandler(),
         logging.FileHandler(log_path, encoding="utf-8"),
