@@ -170,6 +170,7 @@ class ClaudeCodeBridge:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                limit=10 * 1024 * 1024,  # 10MB; default 64KB too small for Claude Code output
             )
         except FileNotFoundError:
             r = StreamResult(assistant_texts=[f"❌ Command not found: {self.ttadk_cmd}. Is ttadk installed and in PATH?"])
