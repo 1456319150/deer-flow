@@ -144,7 +144,7 @@ class FeishuBot:
         """Full message lifecycle: react → stream cards → done."""
         await self._react(msg_id, "OK")
         result = StreamResult()
-        emitted_blocks: list[str] = []
+        emitted_event_keys: set[tuple[str, str]] = set()
         streamed_texts: list[str] = []
         tool_cards: dict[str, dict[str, str]] = {}
         saw_stream_event = False
@@ -179,23 +179,50 @@ class FeishuBot:
                             await self._update_card(tool_card["card_id"], merged)
                             tool_card["content"] = merged
                         continue
+                    if stream_event.kind == "tool_result" and stream_event.tool_use_id:
+                        log.info(
+                            "[RenderCard] mode=reply reason=unbound_tool_result tool=%s tool_use_id=%s",
+                            stream_event.tool_name or "-",
+                            stream_event.tool_use_id,
+                        )
                     block = self._format_stream_event(stream_event)
-                    if not block or block in emitted_blocks:
+                    if not block:
                         continue
-                    emitted_blocks.append(block)
+                    event_key = self._event_dedup_key(stream_event)
+                    if event_key and event_key in emitted_event_keys:
+                        log.info(
+                            "[RenderSkip] reason=dedup kind=%s key=%r",
+                            stream_event.kind,
+                            event_key,
+                        )
+                        continue
+                    if event_key:
+                        emitted_event_keys.add(event_key)
                     log.info(
-                        "[RenderCard] mode=reply blocks=%d content_len=%d last_kind=%s",
-                        len(emitted_blocks),
+                        "[RenderCard] mode=reply content_len=%d last_kind=%s",
                         len(block),
                         stream_event.kind,
                     )
                     card_id = await self._reply_card(msg_id, block)
-                    if stream_event.kind == "tool_use" and stream_event.tool_use_id and card_id:
-                        tool_cards[stream_event.tool_use_id] = {
-                            "card_id": card_id,
-                            "tool_use_block": block,
-                            "content": block,
-                        }
+                    if stream_event.kind == "tool_use" and stream_event.tool_use_id:
+                        if card_id:
+                            tool_cards[stream_event.tool_use_id] = {
+                                "card_id": card_id,
+                                "tool_use_block": block,
+                                "content": block,
+                            }
+                            log.info(
+                                "[RenderCard] mode=bind tool=%s tool_use_id=%s card_id=%s",
+                                stream_event.tool_name or "-",
+                                stream_event.tool_use_id,
+                                card_id,
+                            )
+                        else:
+                            log.info(
+                                "[RenderCard] mode=bind_skipped reason=missing_card_id tool=%s tool_use_id=%s",
+                                stream_event.tool_name or "-",
+                                stream_event.tool_use_id,
+                            )
                 elif event["type"] == "final":
                     result = event["result"]
         except Exception as e:
@@ -209,9 +236,11 @@ class FeishuBot:
         elif result.reply_text:
             final_text = result.reply_text
             reply_so_far = "\n\n".join(streamed_texts).strip()
-            if final_text != reply_so_far and final_text not in emitted_blocks:
-                log.info("[RenderFinalText] text_len=%d preview=%r", len(final_text), _preview_text(final_text))
-                await self._reply_card(msg_id, final_text)
+            if final_text != reply_so_far:
+                final_key = ("result", final_text)
+                if final_key not in emitted_event_keys:
+                    log.info("[RenderFinalText] text_len=%d preview=%r", len(final_text), _preview_text(final_text))
+                    await self._reply_card(msg_id, final_text)
 
         usage_text = self._format_usage_summary(result.usage)
         if usage_text:
@@ -222,6 +251,13 @@ class FeishuBot:
                 log.exception("Reply usage card failed for %s", msg_id)
 
         await self._react(msg_id, "DONE")
+
+    @staticmethod
+    def _event_dedup_key(event: StreamEvent) -> tuple[str, str] | None:
+        if event.kind in {"text", "result"}:
+            text = event.text.strip()
+            return (event.kind, text) if text else None
+        return None
 
     @classmethod
     def _format_stream_event(cls, event: StreamEvent) -> str:

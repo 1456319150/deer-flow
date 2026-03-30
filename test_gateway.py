@@ -679,6 +679,38 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot._reply_card.await_count, 1)
         self.assertNotIn("✅ Result", bot._reply_card.await_args.args[1])
 
+    async def test_handle_repeated_read_tool_use_is_not_deduped_by_same_path(self):
+        bridge = ClaudeCodeBridge({})
+        bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
+
+        async def fake_stream_ask(topic_id, prompt):
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Read", tool_use_id="t1", text="/tmp/a.py")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Read", tool_use_id="t1", text="first")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Read", tool_use_id="t2", text="/tmp/a.py")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Read", tool_use_id="t2", text="second")}
+            yield {"type": "final", "result": StreamResult(tool_calls=[
+                ToolCall(name="Read", input_text="/tmp/a.py", output_text="first"),
+                ToolCall(name="Read", input_text="/tmp/a.py", output_text="second"),
+            ])}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        bot._reply_card = AsyncMock(side_effect=["card-1", "card-2"])
+        bot._update_card = AsyncMock()
+        bot._react = AsyncMock()
+
+        await bot._handle("chat", "msg", "topic", "hello")
+
+        self.assertEqual(bot._reply_card.await_count, 2)
+        rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
+        self.assertIn("🔧 Tool Use: Read", rendered_contents[0])
+        self.assertIn("🔧 Tool Use: Read", rendered_contents[1])
+        self.assertEqual(bot._update_card.await_count, 2)
+        self.assertEqual(bot._update_card.await_args_list[0].args[0], "card-1")
+        self.assertEqual(bot._update_card.await_args_list[1].args[0], "card-2")
+        self.assertIn("📦 Tool Result: Read", bot._update_card.await_args_list[0].args[1])
+        self.assertIn("first", bot._update_card.await_args_list[0].args[1])
+        self.assertIn("second", bot._update_card.await_args_list[1].args[1])
+
     async def test_handle_without_stream_text_appends_final_reply(self):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
