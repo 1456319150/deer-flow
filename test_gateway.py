@@ -14,6 +14,7 @@ from gateway import (
     StreamResult,
     StreamState,
     ToolCall,
+    _preview_text,
     load_config,
     load_dotenv,
 )
@@ -25,6 +26,10 @@ from gateway import (
 
 class TestStreamResult(unittest.TestCase):
     """Tests for the StreamResult dataclass."""
+
+    def test_preview_text_escapes_newlines_and_truncates(self):
+        self.assertEqual(_preview_text("a\nb", limit=10), "a\\nb")
+        self.assertEqual(_preview_text("123456", limit=4), "1234...")
 
     def test_reply_text_prefers_result(self):
         r = StreamResult(result_text="from result", assistant_texts=["from assistant"])

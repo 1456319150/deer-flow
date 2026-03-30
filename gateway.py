@@ -71,6 +71,11 @@ def load_config(path: str = "config.yaml") -> dict:
     return yaml.safe_load(resolved)
 
 
+def _preview_text(text: str, limit: int = 120) -> str:
+    text = text.replace("\n", "\\n")
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 # ===========================================================================
 # Stream Result
 # ===========================================================================
@@ -225,6 +230,14 @@ class ClaudeCodeBridge:
         tool_name: str = "",
         tool_use_id: str = "",
     ) -> None:
+        log.info(
+            "[BridgeEvent] kind=%s tool=%s tool_use_id=%s text_len=%d preview=%r",
+            kind,
+            tool_name or "-",
+            tool_use_id or "-",
+            len(text),
+            _preview_text(text),
+        )
         emitted.append({
             "type": "stream_event",
             "event": StreamEvent(kind=kind, text=text, tool_name=tool_name, tool_use_id=tool_use_id),
@@ -307,6 +320,12 @@ class ClaudeCodeBridge:
 
         elif event_type == "result":
             result.result_text = (event.get("result") or "").strip()
+            log.info(
+                "[BridgeResult] result_len=%d preview=%r session=%s",
+                len(result.result_text),
+                _preview_text(result.result_text),
+                event.get("session_id") or "-",
+            )
             if result.result_text:
                 cls._emit_stream_event(emitted, "result", text=result.result_text)
             session_id = event.get("session_id")
@@ -505,6 +524,13 @@ class FeishuBot:
             async for event in self.bridge.stream_ask(topic_id, text):
                 if event["type"] == "stream_event":
                     stream_event = event["event"]
+                    log.info(
+                        "[RenderEvent] kind=%s tool=%s text_len=%d preview=%r",
+                        stream_event.kind,
+                        stream_event.tool_name or "-",
+                        len(stream_event.text),
+                        _preview_text(stream_event.text),
+                    )
                     if stream_event.kind == "text":
                         streamed_texts.append(stream_event.text)
                     if stream_event.kind == "result":
@@ -518,6 +544,12 @@ class FeishuBot:
                         continue
                     rendered_blocks.append(block)
                     content = self._format_stream_transcript(rendered_blocks)
+                    log.info(
+                        "[RenderCard] blocks=%d content_len=%d last_kind=%s",
+                        len(rendered_blocks),
+                        len(content),
+                        stream_event.kind,
+                    )
                     if card_id:
                         await self._update_card(card_id, content)
                     else:
@@ -530,6 +562,7 @@ class FeishuBot:
 
         if not rendered_blocks:
             card_content = self._format_result(result)
+            log.info("[RenderFallback] content_len=%d", len(card_content))
             if card_id:
                 await self._update_card(card_id, card_content)
             else:
@@ -739,14 +772,25 @@ class FeishuBot:
 # ===========================================================================
 
 async def main() -> None:
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "gateway.log")
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler(log_path, encoding="utf-8"),
+    ]
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+        handlers=handlers,
+        force=True,
     )
 
     cfg = load_config()
     bridge = ClaudeCodeBridge(cfg.get("claude", {}))
     bot = FeishuBot(cfg["feishu"], bridge)
+
+    log.info("[Init] file logging enabled at %s", log_path)
 
     await bot.start()
 
