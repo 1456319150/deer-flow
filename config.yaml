@@ -10,5 +10,6 @@ claude:
   model: gpt-5.4
   target: claude
   timeout: 600               # seconds
-  allowed_tools: "Bash,Read,Write,Edit"
+  session_store_path: .gateway-sessions.json
+  allowed_tools: "Bash,Read,Write,Edit,Glob,WebSearch,WebFetch"
   # instruction: "Always respond in Chinese."  # Optional: prepended to user prompt

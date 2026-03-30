@@ -1,14 +1,18 @@
 """Unit tests for gateway.py — stream-json parsing + rich formatting."""
 
+import asyncio
 import json
 import os
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from gateway import (
     ClaudeCodeBridge,
     FeishuBot,
     StreamResult,
+    StreamSegment,
+    StreamState,
     ToolCall,
     load_config,
     load_dotenv,
@@ -225,6 +229,13 @@ class TestParseStream(unittest.TestCase):
         result = ClaudeCodeBridge._parse_stream(raw)
         self.assertEqual(result.session_id, "sess_123")
 
+    def test_session_id_from_system_init(self):
+        raw = self._build_stream(
+            {"type": "system", "subtype": "init", "session_id": "sess_init"}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertEqual(result.session_id, "sess_init")
+
     def test_noise_lines_ignored(self):
         raw = "=== Claude Code ===\nLoading...\n" + self._build_stream(
             {"type": "assistant", "message": {"content": [{"type": "text", "text": "Hi"}]}}
@@ -387,6 +398,36 @@ class TestBuildCmd(unittest.TestCase):
         self.assertIn("'\"'\"'", args_str)
 
 
+class TestStreamingHelpers(unittest.TestCase):
+
+    def test_consume_stream_line_emits_segment(self):
+        state = StreamState()
+        events = ClaudeCodeBridge._consume_stream_line(
+            state,
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello"}]}}),
+        )
+        self.assertEqual([event["type"] for event in events], ["segment"])
+        self.assertEqual(events[0]["segment"].text, "Hello")
+        self.assertEqual(state.result.assistant_texts, ["Hello"])
+
+    def test_consume_stream_line_tracks_tool_result(self):
+        state = StreamState()
+        ClaudeCodeBridge._consume_stream_line(
+            state,
+            json.dumps({"type": "assistant", "message": {"content": [{
+                "type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pwd"}
+            }]}}),
+        )
+        ClaudeCodeBridge._consume_stream_line(
+            state,
+            json.dumps({"type": "assistant", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "t1", "content": "repo"
+            }]}}),
+        )
+        self.assertEqual(len(state.result.tool_calls), 1)
+        self.assertEqual(state.result.tool_calls[0].output_text, "repo")
+
+
 # ===========================================================================
 # ask() — mocked subprocess
 # ===========================================================================
@@ -395,11 +436,39 @@ class TestBridgeAskMocked(unittest.TestCase):
     """Test ask() with mocked subprocess."""
 
     def test_missing_cmd_returns_error(self):
-        import asyncio
         bridge = ClaudeCodeBridge({"ttadk_cmd": "nonexistent_cmd_99"})
-        result = asyncio.get_event_loop().run_until_complete(bridge.ask("t1", "hi"))
+        result = asyncio.run(bridge.ask("t1", "hi"))
         self.assertIsInstance(result, StreamResult)
         self.assertIn("not found", result.reply_text)
+
+
+class TestSessionPersistence(unittest.TestCase):
+
+    def test_load_sessions_from_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"topic1": "sess_a"}, f)
+            f.flush()
+            bridge = ClaudeCodeBridge({"session_store_path": f.name})
+        self.assertEqual(bridge._sessions, {"topic1": "sess_a"})
+        os.unlink(f.name)
+
+    def test_invalid_session_file_returns_empty(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("not-json")
+            f.flush()
+            bridge = ClaudeCodeBridge({"session_store_path": f.name})
+        self.assertEqual(bridge._sessions, {})
+        os.unlink(f.name)
+
+    def test_remember_session_persists(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            path = f.name
+        os.unlink(path)
+        bridge = ClaudeCodeBridge({"session_store_path": path})
+        asyncio.run(bridge._remember_session("topic1", "sess_a"))
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"topic1": "sess_a"})
+        os.unlink(path)
 
 
 # ===========================================================================
@@ -424,6 +493,47 @@ class TestSessionManagement(unittest.TestCase):
 # ===========================================================================
 # Config / Dotenv / Extract Text
 # ===========================================================================
+
+class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
+
+    async def test_handle_streaming_updates_then_replies(self):
+        bridge = ClaudeCodeBridge({})
+        bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
+
+        async def fake_stream_ask(topic_id, prompt):
+            yield {"type": "segment", "segment": StreamSegment("第一段")}
+            yield {"type": "segment", "segment": StreamSegment("第二段")}
+            yield {"type": "final", "result": StreamResult(assistant_texts=["第一段", "第二段"])}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        bot._reply_card = AsyncMock(side_effect=["card_1", None])
+        bot._update_card = AsyncMock()
+        bot._react = AsyncMock()
+
+        await bot._handle("chat", "msg", "topic", "hello")
+
+        bot._reply_card.assert_any_call("msg", "🤔 Thinking...")
+        bot._update_card.assert_awaited_once_with("card_1", "第一段")
+        bot._reply_card.assert_any_call("msg", "第二段")
+        self.assertEqual(bot._react.await_count, 2)
+
+    async def test_handle_without_stream_segments_falls_back_to_final_result(self):
+        bridge = ClaudeCodeBridge({})
+        bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
+
+        async def fake_stream_ask(topic_id, prompt):
+            yield {"type": "final", "result": StreamResult(tool_calls=[ToolCall(name="Bash", input_text="pwd")])}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        bot._reply_card = AsyncMock(return_value="card_1")
+        bot._update_card = AsyncMock()
+        bot._react = AsyncMock()
+
+        await bot._handle("chat", "msg", "topic", "hello")
+
+        bot._update_card.assert_awaited_once()
+        self.assertIn("🔧 Tool Calls", bot._update_card.await_args.args[1])
+
 
 class TestLoadDotenv(unittest.TestCase):
 

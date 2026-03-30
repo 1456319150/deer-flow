@@ -32,7 +32,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 
 import yaml
 
@@ -84,6 +84,12 @@ class ToolCall:
 
 
 @dataclass
+class StreamSegment:
+    """A single user-visible streamed assistant text block."""
+    text: str
+
+
+@dataclass
 class StreamResult:
     """Structured result from parsing stream-json events."""
     thinking: list[str] = field(default_factory=list)
@@ -106,6 +112,14 @@ class StreamResult:
         return not self.reply_text and not self.tool_calls
 
 
+@dataclass
+class StreamState:
+    """Mutable parser state shared by full and incremental stream parsing."""
+    result: StreamResult = field(default_factory=StreamResult)
+    pending_tools: dict[str, ToolCall] = field(default_factory=dict)
+    segments: list[StreamSegment] = field(default_factory=list)
+
+
 # ===========================================================================
 # Claude Code Bridge
 # ===========================================================================
@@ -120,12 +134,21 @@ class ClaudeCodeBridge:
         self.timeout: int = cfg.get("timeout", 600)
         self.allowed_tools: str = cfg.get("allowed_tools", "")
         self.instruction: str = cfg.get("instruction", "")
-        self._sessions: dict[str, str] = {}
+        self.session_store_path: str = cfg.get("session_store_path", ".gateway-sessions.json")
+        self._session_lock = asyncio.Lock()
+        self._sessions: dict[str, str] = self._load_sessions()
 
     async def ask(self, topic_id: str, prompt: str) -> StreamResult:
         """Send prompt to Claude Code, return structured StreamResult."""
+        result: StreamResult | None = None
+        async for event in self.stream_ask(topic_id, prompt):
+            if event["type"] == "final":
+                result = event["result"]
+        return result or StreamResult()
+
+    async def stream_ask(self, topic_id: str, prompt: str) -> AsyncIterator[dict[str, Any]]:
+        """Stream Claude Code output as user-visible segments plus one final result."""
         session_id = self._sessions.get(topic_id)
-        # Prepend custom instruction (if any) to user prompt
         full_prompt = f"{self.instruction}\n\n{prompt}" if self.instruction else prompt
         cmd = self._build_cmd(full_prompt, session_id)
 
@@ -138,138 +161,176 @@ class ClaudeCodeBridge:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
-        except asyncio.TimeoutError:
+        except FileNotFoundError:
+            r = StreamResult(assistant_texts=[f"❌ Command not found: {self.ttadk_cmd}. Is ttadk installed and in PATH?"])
+            yield {"type": "final", "result": r}
+            return
+
+        state = StreamState()
+        raw_lines: list[str] = []
+
+        try:
+            async with asyncio.timeout(self.timeout):
+                assert proc.stdout is not None
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    decoded = line.decode("utf-8", errors="replace")
+                    raw_lines.append(decoded)
+                    for event in self._consume_stream_line(state, decoded):
+                        if event["type"] == "segment":
+                            yield event
+                        elif event["type"] == "session" and event["session_id"]:
+                            await self._remember_session(topic_id, event["session_id"])
+                await proc.wait()
+        except TimeoutError:
             proc.kill()
             await proc.communicate()
-            r = StreamResult()
-            r.assistant_texts = [f"⏰ Claude Code timed out after {self.timeout}s"]
-            return r
-        except FileNotFoundError:
-            r = StreamResult()
-            r.assistant_texts = [f"❌ Command not found: {self.ttadk_cmd}. Is ttadk installed and in PATH?"]
-            return r
+            r = StreamResult(assistant_texts=[f"⏰ Claude Code timed out after {self.timeout}s"])
+            yield {"type": "final", "result": r}
+            return
 
-        raw = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+        raw = "".join(raw_lines)
         log.info("[Bridge] exit=%d output=%d chars", proc.returncode, len(raw))
 
-        # Auth redirect detection
-        for pattern in (r"https?://\S*auth\S*", r"https?://\S*login\S*", r"https?://\S*oauth\S*"):
-            urls = re.findall(pattern, raw)
-            if urls:
-                r = StreamResult()
-                r.assistant_texts = [f"🔐 需要认证，请在浏览器打开: {urls[0]}"]
-                return r
+        if state.result.session_id:
+            await self._remember_session(topic_id, state.result.session_id)
 
-        # Parse stream-json output
-        result = self._parse_stream(raw)
+        yield {"type": "final", "result": state.result}
 
-        # Update session for multi-turn continuity
-        if result.session_id:
-            self._sessions[topic_id] = result.session_id
-            log.info("[Bridge] session: topic=%s → %s", topic_id, result.session_id)
+    @staticmethod
+    def _event_to_lines(event: dict) -> list[str]:
+        return [json.dumps(event, ensure_ascii=False)]
 
-        return result
+    @classmethod
+    def _consume_stream_line(cls, state: StreamState, line: str) -> list[dict[str, Any]]:
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            return []
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            return []
+        return cls._consume_event(state, event)
+
+    @classmethod
+    def _consume_event(cls, state: StreamState, event: dict[str, Any]) -> list[dict[str, Any]]:
+        emitted: list[dict[str, Any]] = []
+        result = state.result
+        event_type = event.get("type")
+
+        if event_type == "assistant":
+            message = event.get("message", {})
+            content = message.get("content", [])
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+
+                if block_type == "text":
+                    text = block.get("text", "").strip()
+                    if text:
+                        result.assistant_texts.append(text)
+                        segment = StreamSegment(text=text)
+                        state.segments.append(segment)
+                        emitted.append({"type": "segment", "segment": segment})
+
+                elif block_type == "thinking":
+                    thinking = block.get("thinking", "").strip()
+                    if thinking:
+                        result.thinking.append(thinking)
+
+                elif block_type == "tool_use":
+                    tool_id = block.get("id", "")
+                    name = block.get("name", "unknown")
+                    inp = block.get("input", {})
+                    if isinstance(inp, dict):
+                        if "command" in inp:
+                            input_text = inp["command"]
+                        elif "file_path" in inp:
+                            input_text = inp["file_path"]
+                        elif "query" in inp:
+                            input_text = inp["query"]
+                        else:
+                            input_text = json.dumps(inp, ensure_ascii=False)
+                    else:
+                        input_text = str(inp)
+                    tc = ToolCall(name=name, input_text=input_text)
+                    result.tool_calls.append(tc)
+                    if tool_id:
+                        state.pending_tools[tool_id] = tc
+
+                elif block_type == "tool_result":
+                    tool_use_id = block.get("tool_use_id", "")
+                    content_val = block.get("content", "")
+                    if isinstance(content_val, list):
+                        parts = []
+                        for item in content_val:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                parts.append(item.get("text", ""))
+                            elif isinstance(item, str):
+                                parts.append(item)
+                        output = "\n".join(parts)
+                    elif isinstance(content_val, str):
+                        output = content_val
+                    else:
+                        output = str(content_val)
+                    if tool_use_id in state.pending_tools:
+                        state.pending_tools[tool_use_id].output_text = output.strip()
+
+        elif event_type == "system" and event.get("subtype") == "init":
+            session_id = event.get("session_id")
+            if session_id:
+                result.session_id = session_id
+                emitted.append({"type": "session", "session_id": session_id})
+
+        elif event_type == "result":
+            result.result_text = (event.get("result") or "").strip()
+            session_id = event.get("session_id")
+            if session_id:
+                result.session_id = session_id
+                emitted.append({"type": "session", "session_id": session_id})
+
+        return emitted
 
     @staticmethod
     def _parse_stream(raw: str) -> StreamResult:
-        """Parse stream-json output from Claude Code CLI.
-
-        Extracts ALL valuable event types:
-        - thinking: Claude's reasoning process
-        - tool_use + tool_result: what commands/files were accessed
-        - text: the final response text
-        - result: the result field (often empty due to bug)
-        - session_id: for multi-turn continuity
-
-        Event format examples:
-        {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
-        {"type":"assistant","message":{"content":[{"type":"thinking","thinking":"..."}]}}
-        {"type":"assistant","message":{"content":[{"type":"tool_use","id":"...","name":"Bash","input":{"command":"ls"}}]}}
-        {"type":"assistant","message":{"content":[{"type":"tool_result","tool_use_id":"...","content":"output"}]}}
-        {"type":"result","result":"","session_id":"..."}
-        """
-        result = StreamResult()
-        # Track pending tool_use by id so we can pair with tool_result
-        pending_tools: dict[str, ToolCall] = {}
-
+        """Parse stream-json output from Claude Code CLI."""
+        state = StreamState()
         for line in raw.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("{"):
-                continue
-            try:
-                event = json.loads(stripped)
-            except json.JSONDecodeError:
-                continue
+            ClaudeCodeBridge._consume_stream_line(state, line)
+        return state.result
 
-            event_type = event.get("type")
+    def _load_sessions(self) -> dict[str, str]:
+        try:
+            with open(self.session_store_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError):
+            log.warning("[Bridge] failed to load session store: %s", self.session_store_path, exc_info=True)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if k and v}
 
-            if event_type == "assistant":
-                message = event.get("message", {})
-                content = message.get("content", [])
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    block_type = block.get("type")
+    async def _remember_session(self, topic_id: str, session_id: str) -> None:
+        if not topic_id or not session_id or self._sessions.get(topic_id) == session_id:
+            return
+        async with self._session_lock:
+            self._sessions[topic_id] = session_id
+            await asyncio.to_thread(self._save_sessions)
+        log.info("[Bridge] session: topic=%s → %s", topic_id, session_id)
 
-                    if block_type == "text":
-                        text = block.get("text", "").strip()
-                        if text:
-                            result.assistant_texts.append(text)
-
-                    elif block_type == "thinking":
-                        thinking = block.get("thinking", "").strip()
-                        if thinking:
-                            result.thinking.append(thinking)
-
-                    elif block_type == "tool_use":
-                        tool_id = block.get("id", "")
-                        name = block.get("name", "unknown")
-                        inp = block.get("input", {})
-                        # Format input for display
-                        if isinstance(inp, dict):
-                            # Common patterns: Bash has command, Read has file_path, etc.
-                            if "command" in inp:
-                                input_text = inp["command"]
-                            elif "file_path" in inp:
-                                input_text = inp["file_path"]
-                            elif "query" in inp:
-                                input_text = inp["query"]
-                            else:
-                                input_text = json.dumps(inp, ensure_ascii=False)
-                        else:
-                            input_text = str(inp)
-                        tc = ToolCall(name=name, input_text=input_text)
-                        result.tool_calls.append(tc)
-                        if tool_id:
-                            pending_tools[tool_id] = tc
-
-                    elif block_type == "tool_result":
-                        tool_use_id = block.get("tool_use_id", "")
-                        content_val = block.get("content", "")
-                        if isinstance(content_val, list):
-                            # content can be a list of text blocks
-                            parts = []
-                            for item in content_val:
-                                if isinstance(item, dict) and item.get("type") == "text":
-                                    parts.append(item.get("text", ""))
-                                elif isinstance(item, str):
-                                    parts.append(item)
-                            output = "\n".join(parts)
-                        elif isinstance(content_val, str):
-                            output = content_val
-                        else:
-                            output = str(content_val)
-                        if tool_use_id in pending_tools:
-                            pending_tools[tool_use_id].output_text = output.strip()
-
-                    # redacted_thinking: encrypted, not useful — skip
-
-            elif event_type == "result":
-                result.result_text = (event.get("result") or "").strip()
-                result.session_id = event.get("session_id")
-
-        return result
+    def _save_sessions(self) -> None:
+        directory = os.path.dirname(self.session_store_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{self.session_store_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(self._sessions, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp_path, self.session_store_path)
 
     def _build_cmd(self, prompt: str, session_id: str | None) -> list[str]:
         """Build ttadk CLI command list."""
@@ -410,26 +471,42 @@ class FeishuBot:
             log.exception("Error processing message")
 
     async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
-        """Full message lifecycle: react → thinking card → Claude Code → update card → done."""
-        asyncio.create_task(self._react(msg_id, "OK"))
+        """Full message lifecycle: react → streaming cards → done."""
+        await self._react(msg_id, "OK")
         card_id = await self._reply_card(msg_id, "🤔 Thinking...")
+        saw_stream_text = False
+        result = StreamResult()
 
         try:
-            result = await self.bridge.ask(topic_id, text)
+            async for event in self.bridge.stream_ask(topic_id, text):
+                if event["type"] == "segment":
+                    saw_stream_text = True
+                    segment_text = self._format_stream_segment(event["segment"].text)
+                    if card_id:
+                        await self._update_card(card_id, segment_text)
+                        card_id = None
+                    else:
+                        await self._reply_card(msg_id, segment_text)
+                elif event["type"] == "final":
+                    result = event["result"]
         except Exception as e:
             log.exception("Bridge error")
-            r = StreamResult()
-            r.assistant_texts = [f"❌ Error: {e}"]
-            result = r
+            result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
 
-        card_content = self._format_result(result)
-
-        if card_id:
-            await self._update_card(card_id, card_content)
-        else:
-            await self._reply_card(msg_id, card_content)
+        if not saw_stream_text:
+            card_content = self._format_result(result)
+            if card_id:
+                await self._update_card(card_id, card_content)
+            else:
+                await self._reply_card(msg_id, card_content)
 
         await self._react(msg_id, "DONE")
+
+    @classmethod
+    def _format_stream_segment(cls, text: str) -> str:
+        if len(text) > cls.MAX_REPLY:
+            return text[:cls.MAX_REPLY] + "\n\n... (truncated, response too long)"
+        return text
 
     @classmethod
     def _format_result(cls, result: StreamResult) -> str:
