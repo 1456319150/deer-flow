@@ -8,7 +8,6 @@ venv/
 logs/
 .vscode/
 .gateway-sessions.json
-.run/
 .claude/
 
 # WeChat channel state

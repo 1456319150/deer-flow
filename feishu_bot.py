@@ -14,18 +14,15 @@ import json
 import logging
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
-from gateway import ClaudeCodeBridge, StreamResult, StreamEvent, _preview_text
+from gateway import ClaudeCodeBridge, StreamResult, StreamEvent, UsageSummary, _preview_text
 
 log = logging.getLogger("feishu")
 
 
 class FeishuBot:
     """Feishu WebSocket bot with card-based responses."""
-
-    CURRENT_TOPIC_PATH = Path(".run/current_feishu_topic.txt")
 
     # Truncation limits
     MAX_REPLY = 50000
@@ -135,8 +132,6 @@ class FeishuBot:
             if not text:
                 return
 
-            self._remember_current_topic(topic_id)
-
             if self._main_loop and self._main_loop.is_running():
                 fut = asyncio.run_coroutine_threadsafe(
                     self._handle(chat_id, msg_id, topic_id, text), self._main_loop
@@ -217,6 +212,14 @@ class FeishuBot:
             if final_text != reply_so_far and final_text not in emitted_blocks:
                 log.info("[RenderFinalText] text_len=%d preview=%r", len(final_text), _preview_text(final_text))
                 await self._reply_card(msg_id, final_text)
+
+        usage_text = self._format_usage_summary(result.usage)
+        if usage_text:
+            try:
+                log.info("[RenderUsage] content_len=%d", len(usage_text))
+                await self._reply_card(msg_id, usage_text)
+            except Exception:
+                log.exception("Reply usage card failed for %s", msg_id)
 
         await self._react(msg_id, "DONE")
 
@@ -320,6 +323,26 @@ class FeishuBot:
         return "\n\n".join(sections)
 
     @staticmethod
+    def _format_usage_summary(usage: UsageSummary | None) -> str:
+        if not usage or not usage.has_values:
+            return ""
+
+        lines = ["**Usage**"]
+        if usage.input_tokens is not None:
+            lines.append(f"- Input: {usage.input_tokens:,}")
+        if usage.output_tokens is not None:
+            lines.append(f"- Output: {usage.output_tokens:,}")
+        if usage.cache_creation_input_tokens is not None:
+            lines.append(f"- Cache Create: {usage.cache_creation_input_tokens:,}")
+        if usage.cache_read_input_tokens is not None:
+            lines.append(f"- Cache Read: {usage.cache_read_input_tokens:,}")
+        if usage.total_tokens is not None:
+            lines.append(f"- Total: {usage.total_tokens:,}")
+        if usage.cost_usd is not None:
+            lines.append(f"- Cost: ${usage.cost_usd:.4f}")
+        return "\n".join(lines)
+
+    @staticmethod
     def _blockquote(text: str) -> str:
         """Convert multi-line text to blockquote format."""
         return "\n> ".join(text.split("\n"))
@@ -405,16 +428,6 @@ class FeishuBot:
                         paras.append(joined)
             return "\n\n".join(paras)
         return ""
-
-    @classmethod
-    def _remember_current_topic(cls, topic_id: str) -> None:
-        if not topic_id:
-            return
-        try:
-            cls.CURRENT_TOPIC_PATH.parent.mkdir(parents=True, exist_ok=True)
-            cls.CURRENT_TOPIC_PATH.write_text(f"{topic_id}\n", encoding="utf-8")
-        except Exception:
-            log.debug("Remember current topic failed: %s", topic_id, exc_info=True)
 
     @staticmethod
     def _log_err(fut: Any, msg_id: str) -> None:

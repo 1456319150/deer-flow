@@ -6,7 +6,6 @@ import os
 import tempfile
 import types
 import unittest
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from feishu_bot import FeishuBot
@@ -16,7 +15,7 @@ from gateway import (
     StreamResult,
     StreamState,
     ToolCall,
-    _get_initial_message,
+    UsageSummary,
     _preview_text,
     _reset_log_file,
     load_config,
@@ -137,7 +136,6 @@ class TestParseStream(unittest.TestCase):
             ]}}
         )
         result = ClaudeCodeBridge._parse_stream(raw)
-        # Falls through to json.dumps
         self.assertIn("a.py", result.tool_calls[0].input_text)
 
     def test_tool_result_paired(self):
@@ -213,8 +211,62 @@ class TestParseStream(unittest.TestCase):
         self.assertEqual(result.assistant_texts, ["项目包含 README、src 和 tests 目录"])
         self.assertEqual(result.result_text, "")
         self.assertEqual(result.session_id, "sess_xyz")
-        # reply_text should use assistant_texts since result is empty
         self.assertEqual(result.reply_text, "项目包含 README、src 和 tests 目录")
+
+    def test_result_usage_and_cost_are_extracted(self):
+        raw = self._build_stream(
+            {
+                "type": "result",
+                "result": "OK",
+                "session_id": "sess_usage",
+                "total_cost_usd": 0.0165432,
+                "usage": {
+                    "input_tokens": 3716,
+                    "output_tokens": 32,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 16384,
+                },
+            }
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertIsNotNone(result.usage)
+        self.assertEqual(result.usage.input_tokens, 3716)
+        self.assertEqual(result.usage.output_tokens, 32)
+        self.assertEqual(result.usage.cache_creation_input_tokens, 0)
+        self.assertEqual(result.usage.cache_read_input_tokens, 16384)
+        self.assertEqual(result.usage.total_tokens, 20132)
+        self.assertAlmostEqual(result.usage.cost_usd, 0.0165432)
+
+    def test_result_usage_uses_model_usage_fallback(self):
+        raw = self._build_stream(
+            {
+                "type": "result",
+                "result": "OK",
+                "modelUsage": {
+                    "gpt-5.4": {
+                        "inputTokens": 10,
+                        "outputTokens": 2,
+                        "cacheReadInputTokens": 7,
+                        "costUSD": 0.0025,
+                    }
+                },
+            }
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertIsNotNone(result.usage)
+        self.assertEqual(result.usage.input_tokens, 10)
+        self.assertEqual(result.usage.output_tokens, 2)
+        self.assertEqual(result.usage.cache_read_input_tokens, 7)
+        self.assertEqual(result.usage.total_tokens, 19)
+        self.assertAlmostEqual(result.usage.cost_usd, 0.0025)
+
+    def test_invalid_usage_shape_is_ignored(self):
+        raw = self._build_stream(
+            {"type": "result", "result": "OK", "usage": "not-a-dict", "total_cost_usd": "bad-value"}
+        )
+        result = ClaudeCodeBridge._parse_stream(raw)
+        self.assertIsNone(result.usage)
+        self.assertEqual(result.reply_text, "OK")
 
     def test_multiple_tool_calls(self):
         raw = self._build_stream(
@@ -332,7 +384,6 @@ class TestFormatResult(unittest.TestCase):
         self.assertIn("2. Read", output)
         self.assertIn("/src/main.py", output)
         self.assertIn("Found 2 files.", output)
-        # Separator between process and reply
         self.assertIn("---", output)
 
     def test_full_format(self):
@@ -342,7 +393,6 @@ class TestFormatResult(unittest.TestCase):
             assistant_texts=["Project has 2 files."]
         )
         output = FeishuBot._format_result(r)
-        # All sections present in order
         thinking_pos = output.index("💭 Thinking")
         tools_pos = output.index("🔧 Tool Calls")
         reply_pos = output.index("Project has 2 files.")
@@ -355,14 +405,11 @@ class TestFormatResult(unittest.TestCase):
         self.assertIn("未生成文字回复", output)
 
     def test_tool_calls_only_no_text(self):
-        """Tools ran but no text response — should show tools + fallback."""
         r = StreamResult(
             tool_calls=[ToolCall(name="Bash", input_text="make build", output_text="OK")]
         )
         output = FeishuBot._format_result(r)
         self.assertIn("🔧 Tool Calls", output)
-        # is_empty is False because tool_calls exist, but reply_text is empty
-        # So we show tool calls but no fallback message
         self.assertIn("make build", output)
 
     def test_thinking_truncated(self):
@@ -374,7 +421,6 @@ class TestFormatResult(unittest.TestCase):
         self.assertIn("thinking truncated", output)
 
     def test_tool_calls_overflow(self):
-        """More than MAX_TOOL_CALLS_SHOWN shows '... and N more'."""
         calls = [ToolCall(name=f"Tool{i}", input_text=f"cmd{i}") for i in range(15)]
         r = StreamResult(tool_calls=calls, assistant_texts=["Done"])
         output = FeishuBot._format_result(r)
@@ -387,6 +433,26 @@ class TestFormatResult(unittest.TestCase):
         )
         output = FeishuBot._format_result(r)
         self.assertIn("...", output)
+
+    def test_format_usage_summary_returns_empty_without_usage(self):
+        self.assertEqual(FeishuBot._format_usage_summary(None), "")
+
+    def test_format_usage_summary_includes_expected_fields(self):
+        usage = UsageSummary(
+            input_tokens=1200,
+            output_tokens=34,
+            cache_creation_input_tokens=20,
+            cache_read_input_tokens=400,
+            total_tokens=1654,
+            cost_usd=0.0165,
+        )
+        output = FeishuBot._format_usage_summary(usage)
+        self.assertIn("**Usage**", output)
+        self.assertIn("- Input: 1,200", output)
+        self.assertIn("- Cache Create: 20", output)
+        self.assertIn("- Cache Read: 400", output)
+        self.assertIn("- Total: 1,654", output)
+        self.assertIn("- Cost: $0.0165", output)
 
 
 # ===========================================================================
@@ -412,7 +478,6 @@ class TestBuildCmd(unittest.TestCase):
         self.assertIn("--verbose", args_str)
 
     def test_no_system_prompt(self):
-        """--system-prompt should NOT be in the command (breaks Claude Code)."""
         cmd = self.bridge._build_cmd("hello", None)
         args_str = " ".join(cmd)
         self.assertNotIn("--system-prompt", args_str)
@@ -481,12 +546,21 @@ class TestStreamingHelpers(unittest.TestCase):
         state = StreamState()
         events = ClaudeCodeBridge._consume_stream_line(
             state,
-            json.dumps({"type": "result", "result": "Done", "session_id": "sess_1"}),
+            json.dumps({
+                "type": "result",
+                "result": "Done",
+                "session_id": "sess_1",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "total_cost_usd": 0.0012,
+            }),
         )
         self.assertEqual([event["type"] for event in events], ["stream_event", "session"])
         self.assertEqual(events[0]["event"].kind, "result")
         self.assertEqual(events[0]["event"].text, "Done")
         self.assertEqual(state.result.session_id, "sess_1")
+        self.assertIsNotNone(state.result.usage)
+        self.assertEqual(state.result.usage.total_tokens, 12)
+        self.assertAlmostEqual(state.result.usage.cost_usd, 0.0012)
 
 
 # ===========================================================================
@@ -639,12 +713,32 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bot._reply_card.assert_awaited_once()
         self.assertIn("🔧 Tool Calls", bot._reply_card.await_args.args[1])
 
-    def test_remember_current_topic_persists_latest_topic(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            topic_path = Path(temp_dir) / "current_feishu_topic.txt"
-            with patch.object(FeishuBot, "CURRENT_TOPIC_PATH", topic_path):
-                FeishuBot._remember_current_topic("topic-123")
-            self.assertEqual(topic_path.read_text(encoding="utf-8"), "topic-123\n")
+    async def test_handle_sends_usage_card_after_main_reply(self):
+        bridge = ClaudeCodeBridge({})
+        bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
+
+        async def fake_stream_ask(topic_id, prompt):
+            yield {
+                "type": "final",
+                "result": StreamResult(
+                    assistant_texts=["主回复"],
+                    usage=UsageSummary(input_tokens=1200, output_tokens=34, total_tokens=1234, cost_usd=0.0165),
+                ),
+            }
+
+        bot.bridge.stream_ask = fake_stream_ask
+        bot._reply_card = AsyncMock(side_effect=["card-main", "card-usage"])
+        bot._react = AsyncMock()
+
+        await bot._handle("chat", "msg", "topic", "hello")
+
+        self.assertEqual(bot._reply_card.await_count, 2)
+        self.assertEqual(bot._reply_card.await_args_list[0].args[1], "主回复")
+        usage_text = bot._reply_card.await_args_list[1].args[1]
+        self.assertIn("**Usage**", usage_text)
+        self.assertIn("- Input: 1,200", usage_text)
+        self.assertIn("- Total: 1,234", usage_text)
+        self.assertIn("- Cost: $0.0165", usage_text)
 
 
 class TestLoadDotenv(unittest.TestCase):
@@ -718,43 +812,20 @@ class TestLoadConfig(unittest.TestCase):
         self.assertFalse(cfg["key"])
 
 
-class TestInitialMessage(unittest.TestCase):
-
-    def test_get_initial_message_requires_both_values(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("GATEWAY_INITIAL_TOPIC_ID", None)
-            os.environ.pop("GATEWAY_INITIAL_PROMPT", None)
-            self.assertIsNone(_get_initial_message())
-
-            os.environ["GATEWAY_INITIAL_TOPIC_ID"] = "topic-1"
-            self.assertIsNone(_get_initial_message())
-
-            os.environ.pop("GATEWAY_INITIAL_TOPIC_ID", None)
-            os.environ["GATEWAY_INITIAL_PROMPT"] = "hello"
-            self.assertIsNone(_get_initial_message())
-
-    def test_get_initial_message_returns_stripped_values(self):
-        with patch.dict(os.environ, {
-            "GATEWAY_INITIAL_TOPIC_ID": "  topic-1  ",
-            "GATEWAY_INITIAL_PROMPT": "  hello world  ",
-        }, clear=False):
-            self.assertEqual(_get_initial_message(), ("topic-1", "hello world"))
-
-
 class TestGatewayMain(unittest.IsolatedAsyncioTestCase):
 
-    async def test_main_sends_initial_prompt_before_starting_channels(self):
+    async def test_main_starts_feishu_channel(self):
         cfg = {
             "claude": {},
             "feishu": {"app_id": "app", "app_secret": "secret"},
             "weixin": {"enabled": False},
         }
         events: list[str] = []
-        bridge = AsyncMock()
-        bridge.ask = AsyncMock(side_effect=lambda topic, prompt: events.append(f"ask:{topic}:{prompt}") or StreamResult(assistant_texts=["ok"]))
+        bridge = object()
 
         class FakeFeishuBot:
             def __init__(self, feishu_cfg, bridge_obj):
+                events.append("feishu_init")
                 self.feishu_cfg = feishu_cfg
                 self.bridge_obj = bridge_obj
 
@@ -766,49 +837,53 @@ class TestGatewayMain(unittest.IsolatedAsyncioTestCase):
         with (
             patch("gateway.load_config", return_value=cfg),
             patch("gateway.ClaudeCodeBridge", return_value=bridge),
-            patch.dict(os.environ, {
-                "GATEWAY_INITIAL_TOPIC_ID": "topic-1",
-                "GATEWAY_INITIAL_PROMPT": "restart-and-continue",
-            }, clear=False),
             patch.dict(os.sys.modules, {"feishu_bot": fake_feishu_module}),
             patch("asyncio.Event.wait", new=AsyncMock(side_effect=asyncio.CancelledError)),
         ):
             await main()
 
-        self.assertEqual(events, ["ask:topic-1:restart-and-continue", "feishu_start"])
-        bridge.ask.assert_awaited_once_with("topic-1", "restart-and-continue")
+        self.assertEqual(events, ["feishu_init", "feishu_start"])
 
-    async def test_main_skips_initial_prompt_when_missing(self):
+    async def test_main_starts_weixin_when_enabled(self):
         cfg = {
             "claude": {},
             "feishu": {"app_id": "app", "app_secret": "secret"},
-            "weixin": {"enabled": False},
+            "weixin": {"enabled": True},
         }
-        bridge = AsyncMock()
-        bridge.ask = AsyncMock()
+        events: list[str] = []
+        bridge = object()
 
         class FakeFeishuBot:
             def __init__(self, feishu_cfg, bridge_obj):
-                self.feishu_cfg = feishu_cfg
+                events.append("feishu_init")
+
+            async def start(self):
+                events.append("feishu_start")
+
+        class FakeWeixinBot:
+            def __init__(self, weixin_cfg, bridge_obj):
+                events.append("weixin_init")
+                self.weixin_cfg = weixin_cfg
                 self.bridge_obj = bridge_obj
 
             async def start(self):
-                pass
+                events.append("weixin_start")
 
         fake_feishu_module = types.SimpleNamespace(FeishuBot=FakeFeishuBot)
+        fake_weixin_module = types.SimpleNamespace(WeixinBot=FakeWeixinBot)
 
         with (
             patch("gateway.load_config", return_value=cfg),
             patch("gateway.ClaudeCodeBridge", return_value=bridge),
-            patch.dict(os.environ, {}, clear=False),
-            patch.dict(os.sys.modules, {"feishu_bot": fake_feishu_module}),
+            patch.dict(os.sys.modules, {
+                "feishu_bot": fake_feishu_module,
+                "weixin_bot": fake_weixin_module,
+            }),
             patch("asyncio.Event.wait", new=AsyncMock(side_effect=asyncio.CancelledError)),
         ):
-            os.environ.pop("GATEWAY_INITIAL_TOPIC_ID", None)
-            os.environ.pop("GATEWAY_INITIAL_PROMPT", None)
             await main()
 
-        bridge.ask.assert_not_called()
+        self.assertEqual(events, ["feishu_init", "feishu_start", "weixin_init", "weixin_start"])
 
 
 class TestExtractText(unittest.TestCase):

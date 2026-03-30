@@ -30,15 +30,21 @@ WeChat user ──HTTP long-poll──→ WeixinBot ─┘
 
 ## Quick Start
 
-```bash
-# 1. Install deps
-pip install -r requirements.txt
+推荐直接使用前台启动脚本：
 
-# 2. Set env vars for Feishu (optional if only using WeChat)
+```bash
+# 1. Set env vars for Feishu (optional if only using WeChat)
 export FEISHU_APP_ID=cli_xxxx
 export FEISHU_APP_SECRET=xxxx
 
-# 3. Start gateway
+# 2. Start gateway in foreground
+./run.sh
+```
+
+`run.sh` 现在只负责准备本地 Python 环境并前台执行 `python gateway.py`。
+如果你已经自己管理好了虚拟环境，也可以直接运行：
+
+```bash
 python gateway.py
 ```
 
@@ -129,10 +135,11 @@ Behavior:
 
 These files are local runtime state and are already ignored by git:
 
+- `.gateway-sessions.json`: Claude session mapping used for cross-message continuity
 - `.weixin-account.json`: saved login credential (`bot_token`)
 - `.weixin-context-tokens.json`: latest `context_token` per user
 - `.weixin-sync-cursor.json`: last `get_updates_buf` cursor for crash recovery
-- `logs/`: runtime logs, truncated on each startup
+- `logs/gateway.log`: the only runtime log file, truncated on each startup
 
 ## WeChat Authorization Modes
 
@@ -205,3 +212,5 @@ python weixin_login.py
 - WeChat replies are plain text; markdown is stripped before sending
 - Feishu and WeChat can run at the same time in one gateway process
 - startup truncates `logs/gateway.log` intentionally to save disk space
+- shell 层的 `current-topic` / `initial-prompt` / `restart-helper` 自重启链路已移除
+- Claude 会话连续性仍由 `.gateway-sessions.json` 保持，不依赖 shell 续接

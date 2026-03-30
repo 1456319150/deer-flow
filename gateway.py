@@ -65,7 +65,7 @@ def load_config(path: str = "config.yaml") -> dict:
     load_dotenv()
     with open(path) as f:
         raw = f.read()
-    resolved = re.sub(r"\$\{(\w+)}", lambda m: os.environ.get(m.group(1), ""), raw)
+    resolved = re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), raw)
     return yaml.safe_load(resolved)
 
 
@@ -77,14 +77,6 @@ def _preview_text(text: str, limit: int = 120) -> str:
 def _reset_log_file(path: str) -> None:
     with open(path, "w", encoding="utf-8"):
         pass
-
-
-def _get_initial_message() -> tuple[str, str] | None:
-    topic_id = os.environ.get("GATEWAY_INITIAL_TOPIC_ID", "").strip()
-    prompt = os.environ.get("GATEWAY_INITIAL_PROMPT", "").strip()
-    if not topic_id or not prompt:
-        return None
-    return topic_id, prompt
 
 
 # ===========================================================================
@@ -109,6 +101,31 @@ class StreamEvent:
 
 
 @dataclass
+class UsageSummary:
+    """Token and billing summary from the final Claude Code result event."""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    total_tokens: int | None = None
+    cost_usd: float | None = None
+
+    @property
+    def has_values(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.input_tokens,
+                self.output_tokens,
+                self.cache_creation_input_tokens,
+                self.cache_read_input_tokens,
+                self.total_tokens,
+                self.cost_usd,
+            )
+        )
+
+
+@dataclass
 class StreamResult:
     """Structured result from parsing stream-json events."""
     thinking: list[str] = field(default_factory=list)
@@ -116,6 +133,7 @@ class StreamResult:
     assistant_texts: list[str] = field(default_factory=list)
     result_text: str = ""
     session_id: str | None = None
+    usage: UsageSummary | None = None
 
     @property
     def reply_text(self) -> str:
@@ -268,6 +286,122 @@ class ClaudeCodeBridge:
             return content_val.strip()
         return str(content_val).strip()
 
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return int(stripped)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return float(stripped)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _first_coerced_value(
+        cls,
+        sources: tuple[dict[str, Any], ...],
+        keys: tuple[str, ...],
+        coercer: Any,
+    ) -> Any:
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in keys:
+                if key not in source:
+                    continue
+                value = coercer(source.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    @classmethod
+    def _extract_usage_summary(cls, event: dict[str, Any]) -> UsageSummary | None:
+        usage = event.get("usage")
+        usage_dict = usage if isinstance(usage, dict) else {}
+
+        model_usage = event.get("modelUsage")
+        model_usage_dict: dict[str, Any] = {}
+        if isinstance(model_usage, dict):
+            for value in model_usage.values():
+                if isinstance(value, dict):
+                    model_usage_dict = value
+                    break
+
+        input_tokens = cls._first_coerced_value(
+            (usage_dict, model_usage_dict),
+            ("input_tokens", "prompt_tokens", "inputTokens", "promptTokens"),
+            cls._coerce_int,
+        )
+        output_tokens = cls._first_coerced_value(
+            (usage_dict, model_usage_dict),
+            ("output_tokens", "completion_tokens", "outputTokens", "completionTokens"),
+            cls._coerce_int,
+        )
+        cache_creation_input_tokens = cls._first_coerced_value(
+            (usage_dict, model_usage_dict),
+            ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+            cls._coerce_int,
+        )
+        cache_read_input_tokens = cls._first_coerced_value(
+            (usage_dict, model_usage_dict),
+            ("cache_read_input_tokens", "cacheReadInputTokens"),
+            cls._coerce_int,
+        )
+        total_tokens = cls._first_coerced_value(
+            (usage_dict, model_usage_dict),
+            ("total_tokens", "totalTokens"),
+            cls._coerce_int,
+        )
+        cost_usd = cls._first_coerced_value(
+            (event, usage_dict, model_usage_dict),
+            ("total_cost_usd", "cost_usd", "totalCostUsd", "costUSD", "cost"),
+            cls._coerce_float,
+        )
+
+        if total_tokens is None:
+            token_values = [
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            ]
+            if any(value is not None for value in token_values):
+                total_tokens = sum(value or 0 for value in token_values)
+
+        summary = UsageSummary(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
+        )
+        return summary if summary.has_values else None
+
     @classmethod
     def _consume_event(cls, state: StreamState, event: dict[str, Any]) -> list[dict[str, Any]]:
         emitted: list[dict[str, Any]] = []
@@ -346,12 +480,23 @@ class ClaudeCodeBridge:
 
         elif event_type == "result":
             result.result_text = (event.get("result") or "").strip()
+            result.usage = cls._extract_usage_summary(event)
             log.info(
                 "[BridgeResult] result_len=%d preview=%r session=%s",
                 len(result.result_text),
                 _preview_text(result.result_text),
                 event.get("session_id") or "-",
             )
+            if result.usage:
+                log.info(
+                    "[BridgeUsage] input=%s output=%s cache_write=%s cache_read=%s total=%s cost_usd=%s",
+                    result.usage.input_tokens,
+                    result.usage.output_tokens,
+                    result.usage.cache_creation_input_tokens,
+                    result.usage.cache_read_input_tokens,
+                    result.usage.total_tokens,
+                    result.usage.cost_usd,
+                )
             if result.result_text:
                 cls._emit_stream_event(emitted, "result", text=result.result_text)
             session_id = event.get("session_id")
@@ -438,16 +583,6 @@ async def main() -> None:
     bridge = ClaudeCodeBridge(cfg.get("claude", {}))
 
     log.info("[Init] file logging enabled at %s", log_path)
-
-    initial_message = _get_initial_message()
-    if initial_message:
-        initial_topic_id, initial_prompt = initial_message
-        log.info("[Init] sending initial prompt to topic=%s prompt=%r", initial_topic_id, _preview_text(initial_prompt))
-        result = await bridge.ask(initial_topic_id, initial_prompt)
-        if result.reply_text:
-            log.info("[Init] initial reply: %s", _preview_text(result.reply_text))
-        else:
-            log.info("[Init] initial prompt finished with empty reply")
 
     # Feishu channel
     from feishu_bot import FeishuBot

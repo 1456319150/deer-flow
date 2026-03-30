@@ -31,7 +31,7 @@ from weixin_channel import (
 )
 
 # Import from gateway — these are the shared types
-from gateway import ClaudeCodeBridge, StreamResult, _preview_text
+from gateway import ClaudeCodeBridge, StreamResult, UsageSummary, _preview_text
 
 log = logging.getLogger("weixin_bot")
 
@@ -156,6 +156,15 @@ class WeixinBot:
             await self._channel.send_text(
                 from_user, ctx_token, "(Claude Code 已执行操作但未生成文字回复)")
 
+        usage_text = self._format_usage_summary(result.usage)
+        if usage_text:
+            try:
+                log.info("[WeixinBot] 发送统计 to=%s len=%d preview=%r",
+                         from_user, len(usage_text), _preview_text(usage_text))
+                await self._channel.send_text(from_user, ctx_token, usage_text)
+            except Exception:
+                log.exception("[WeixinBot] Failed to send usage summary to %s", from_user)
+
         # Cancel typing
         if ctx_token:
             await self._channel.send_typing(from_user, ctx_token, typing=False)
@@ -205,3 +214,23 @@ class WeixinBot:
             sections.append(reply)
 
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _format_usage_summary(usage: UsageSummary | None) -> str:
+        if not usage or not usage.has_values:
+            return ""
+
+        lines = ["用量统计"]
+        if usage.input_tokens is not None:
+            lines.append(f"输入 tokens: {usage.input_tokens:,}")
+        if usage.output_tokens is not None:
+            lines.append(f"输出 tokens: {usage.output_tokens:,}")
+        if usage.cache_creation_input_tokens is not None:
+            lines.append(f"缓存写入 tokens: {usage.cache_creation_input_tokens:,}")
+        if usage.cache_read_input_tokens is not None:
+            lines.append(f"缓存命中 tokens: {usage.cache_read_input_tokens:,}")
+        if usage.total_tokens is not None:
+            lines.append(f"总 tokens: {usage.total_tokens:,}")
+        if usage.cost_usd is not None:
+            lines.append(f"金额: ${usage.cost_usd:.4f}")
+        return "\n".join(lines)
