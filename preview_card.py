@@ -4,7 +4,8 @@ Run: python3 preview_card.py
 No dependencies needed — just prints the formatted Markdown.
 """
 
-from gateway import ClaudeCodeBridge, FeishuBot, StreamResult, ToolCall
+from feishu_bot import FeishuBot
+from gateway import ClaudeCodeBridge, StreamResult, ToolCall
 
 # ============================================================
 # Scenario 1: Full workflow — thinking + tools + reply

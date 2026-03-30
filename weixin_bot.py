@@ -47,7 +47,6 @@ class WeixinBot:
     - Re-login prompt on session expiry
     """
 
-    MAX_REPLY_LEN = 4000  # WeChat message length limit per chunk
     MSG_MAX_AGE = 120     # Skip messages older than 2 min (offline replay)
 
     def __init__(self, cfg: dict, bridge: ClaudeCodeBridge):

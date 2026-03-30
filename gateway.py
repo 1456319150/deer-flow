@@ -178,7 +178,7 @@ class ClaudeCodeBridge:
             return
 
         state = StreamState()
-        raw_lines: list[str] = []
+        output_len = 0
 
         try:
             async with asyncio.timeout(self.timeout):
@@ -188,7 +188,7 @@ class ClaudeCodeBridge:
                     if not line:
                         break
                     decoded = line.decode("utf-8", errors="replace")
-                    raw_lines.append(decoded)
+                    output_len += len(decoded)
                     for event in self._consume_stream_line(state, decoded):
                         if event["type"] == "session" and event["session_id"]:
                             await self._remember_session(topic_id, event["session_id"])
@@ -202,8 +202,7 @@ class ClaudeCodeBridge:
             yield {"type": "final", "result": r}
             return
 
-        raw = "".join(raw_lines)
-        log.info("[Bridge] exit=%d output=%d chars", proc.returncode, len(raw))
+        log.info("[Bridge] exit=%d output=%d chars", proc.returncode, output_len)
 
         if state.result.session_id:
             await self._remember_session(topic_id, state.result.session_id)
