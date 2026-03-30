@@ -31,9 +31,14 @@ ARG_INITIAL_PROMPT=""
 HAS_ARG_INITIAL_TOPIC_ID=0
 HAS_ARG_INITIAL_PROMPT=0
 USE_CURRENT_TOPIC=0
+DETACH_AFTER_READY=1
+RESTART_HELPER=0
 GATEWAY_LOG_PATH="logs/gateway.log"
+GATEWAY_STDOUT_LOG_PATH="logs/gateway.stdout.log"
+SELF_RESTART_LOG_PATH=".run/self-restart.log"
 GATEWAY_READY_MARKER="Gateway running. Ctrl+C to stop."
 GATEWAY_READY_TIMEOUT_SECONDS=20
+GATEWAY_READY_TIMEOUT_WITH_INIT_SECONDS=90
 
 usage() {
     cat <<'EOF' >&2
@@ -41,6 +46,7 @@ usage() {
   ./run.sh
   ./run.sh --current-topic --initial-prompt "继续处理"
   ./run.sh --initial-topic-id <topic_id> --initial-prompt "继续处理"
+  ./run.sh --restart-helper --initial-topic-id <topic_id> --initial-prompt "继续处理"
 EOF
 }
 
@@ -66,6 +72,10 @@ while [ $# -gt 0 ]; do
             ;;
         --current-topic)
             USE_CURRENT_TOPIC=1
+            shift
+            ;;
+        --restart-helper)
+            RESTART_HELPER=1
             shift
             ;;
         --)
@@ -200,7 +210,7 @@ print_log_tail() {
 from pathlib import Path
 
 log_path = Path('logs/gateway.log')
-for line in log_path.read_text(encoding='utf-8', errors='ignore').splitlines()[-50:]:
+for line in log_path.read_text(encoding='utf-8', errors='ignore').splitlines()[-80:]:
     print(line)
 PY
 }
@@ -247,22 +257,28 @@ stop_existing_gateway() {
     rm -f "$GATEWAY_PID_FILE"
 }
 
-cleanup() {
-    if [ -n "${GATEWAY_PID_FILE:-}" ] && [ -f "$GATEWAY_PID_FILE" ]; then
-        local current_pid
-        current_pid="$(tr -d '[:space:]' < "$GATEWAY_PID_FILE" 2>/dev/null || true)"
-        if [ -n "$current_pid" ] && ! pid_is_running "$current_pid"; then
-            rm -f "$GATEWAY_PID_FILE"
-        fi
-    fi
+start_gateway_detached() {
+    mkdir -p logs
+    touch "$GATEWAY_STDOUT_LOG_PATH"
+
+    echo ">>> 启动新 gateway 进程"
+    nohup python3 gateway.py >> "$GATEWAY_STDOUT_LOG_PATH" 2>&1 < /dev/null &
+    GATEWAY_PID=$!
+    disown "$GATEWAY_PID" 2>/dev/null || true
+    printf '%s\n' "$GATEWAY_PID" > "$GATEWAY_PID_FILE"
 }
 
 wait_for_gateway_ready() {
     local pid="$1"
+    local timeout="$GATEWAY_READY_TIMEOUT_SECONDS"
+
+    if [ -n "${GATEWAY_INITIAL_TOPIC_ID:-}" ] && [ -n "${GATEWAY_INITIAL_PROMPT:-}" ]; then
+        timeout="$GATEWAY_READY_TIMEOUT_WITH_INIT_SECONDS"
+    fi
 
     echo ">>> 等待 gateway 完成渠道初始化..."
 
-    for _ in $(seq 1 "$GATEWAY_READY_TIMEOUT_SECONDS"); do
+    for _ in $(seq 1 "$timeout"); do
         if ! pid_is_running "$pid"; then
             echo ">>> gateway 在完成初始化前已退出" >&2
             print_log_tail >&2
@@ -284,15 +300,30 @@ PY
         sleep 1
     done
 
-    echo ">>> 在 ${GATEWAY_READY_TIMEOUT_SECONDS} 秒内未看到 ready 日志，继续保持前台等待" >&2
+    echo ">>> 在 ${timeout} 秒内未看到 ready 日志" >&2
     print_log_tail >&2
-    return 0
+    return 1
+}
+
+schedule_async_restart() {
+    mkdir -p .run
+    touch "$SELF_RESTART_LOG_PATH"
+
+    nohup "$SCRIPT_DIR/run.sh" \
+        --restart-helper \
+        --initial-topic-id "$INITIAL_TOPIC_ID" \
+        --initial-prompt "$INITIAL_PROMPT" \
+        >> "$SELF_RESTART_LOG_PATH" 2>&1 < /dev/null &
+    local helper_pid=$!
+    disown "$helper_pid" 2>/dev/null || true
+
+    echo ">>> 已安排后台自重启: helper_pid=$helper_pid"
+    echo ">>> 自重启日志: $SELF_RESTART_LOG_PATH"
 }
 
 load_feishu_app_id
-mkdir -p .run
+mkdir -p .run logs
 GATEWAY_PID_FILE=".run/gateway.${FEISHU_APP_ID:-default}.pid"
-trap cleanup EXIT INT TERM
 
 if [ "$USE_CURRENT_TOPIC" -eq 1 ]; then
     if ! INITIAL_TOPIC_ID="$(resolve_current_topic_id)"; then
@@ -323,12 +354,19 @@ if [ -n "${GATEWAY_INITIAL_PROMPT:-}" ]; then
     echo "Initial Prompt: 已设置 (${#GATEWAY_INITIAL_PROMPT} chars)"
 fi
 
+if [ "$RESTART_HELPER" -eq 0 ] && [ -n "$INITIAL_PROMPT" ]; then
+    schedule_async_restart
+    exit 0
+fi
+
+if [ "$RESTART_HELPER" -eq 1 ]; then
+    sleep 1
+fi
+
 stop_existing_gateway
-
-echo ">>> 启动新 gateway 进程"
-python3 gateway.py &
-GATEWAY_PID=$!
-printf '%s\n' "$GATEWAY_PID" > "$GATEWAY_PID_FILE"
-
+start_gateway_detached
 wait_for_gateway_ready "$GATEWAY_PID"
-wait "$GATEWAY_PID"
+
+echo ">>> gateway 已重启完成"
+echo ">>> pid 文件: $GATEWAY_PID_FILE"
+echo ">>> 日志文件: $GATEWAY_LOG_PATH"
