@@ -84,9 +84,12 @@ class ToolCall:
 
 
 @dataclass
-class StreamSegment:
-    """A single user-visible streamed assistant text block."""
-    text: str
+class StreamEvent:
+    """A single user-visible event parsed from Claude Code stream-json."""
+    kind: str
+    text: str = ""
+    tool_name: str = ""
+    tool_use_id: str = ""
 
 
 @dataclass
@@ -117,7 +120,6 @@ class StreamState:
     """Mutable parser state shared by full and incremental stream parsing."""
     result: StreamResult = field(default_factory=StreamResult)
     pending_tools: dict[str, ToolCall] = field(default_factory=dict)
-    segments: list[StreamSegment] = field(default_factory=list)
 
 
 # ===========================================================================
@@ -147,7 +149,7 @@ class ClaudeCodeBridge:
         return result or StreamResult()
 
     async def stream_ask(self, topic_id: str, prompt: str) -> AsyncIterator[dict[str, Any]]:
-        """Stream Claude Code output as user-visible segments plus one final result."""
+        """Stream Claude Code output as immediate events plus one final result."""
         session_id = self._sessions.get(topic_id)
         full_prompt = f"{self.instruction}\n\n{prompt}" if self.instruction else prompt
         cmd = self._build_cmd(full_prompt, session_id)
@@ -179,10 +181,10 @@ class ClaudeCodeBridge:
                     decoded = line.decode("utf-8", errors="replace")
                     raw_lines.append(decoded)
                     for event in self._consume_stream_line(state, decoded):
-                        if event["type"] == "segment":
-                            yield event
-                        elif event["type"] == "session" and event["session_id"]:
+                        if event["type"] == "session" and event["session_id"]:
                             await self._remember_session(topic_id, event["session_id"])
+                        else:
+                            yield event
                 await proc.wait()
         except TimeoutError:
             proc.kill()
@@ -215,6 +217,20 @@ class ClaudeCodeBridge:
         return cls._consume_event(state, event)
 
     @classmethod
+    def _emit_stream_event(
+        cls,
+        emitted: list[dict[str, Any]],
+        kind: str,
+        text: str = "",
+        tool_name: str = "",
+        tool_use_id: str = "",
+    ) -> None:
+        emitted.append({
+            "type": "stream_event",
+            "event": StreamEvent(kind=kind, text=text, tool_name=tool_name, tool_use_id=tool_use_id),
+        })
+
+    @classmethod
     def _consume_event(cls, state: StreamState, event: dict[str, Any]) -> list[dict[str, Any]]:
         emitted: list[dict[str, Any]] = []
         result = state.result
@@ -232,14 +248,13 @@ class ClaudeCodeBridge:
                     text = block.get("text", "").strip()
                     if text:
                         result.assistant_texts.append(text)
-                        segment = StreamSegment(text=text)
-                        state.segments.append(segment)
-                        emitted.append({"type": "segment", "segment": segment})
+                        cls._emit_stream_event(emitted, "text", text=text)
 
                 elif block_type == "thinking":
                     thinking = block.get("thinking", "").strip()
                     if thinking:
                         result.thinking.append(thinking)
+                        cls._emit_stream_event(emitted, "thinking", text=thinking)
 
                 elif block_type == "tool_use":
                     tool_id = block.get("id", "")
@@ -260,6 +275,7 @@ class ClaudeCodeBridge:
                     result.tool_calls.append(tc)
                     if tool_id:
                         state.pending_tools[tool_id] = tc
+                    cls._emit_stream_event(emitted, "tool_use", text=input_text, tool_name=name, tool_use_id=tool_id)
 
                 elif block_type == "tool_result":
                     tool_use_id = block.get("tool_use_id", "")
@@ -276,8 +292,12 @@ class ClaudeCodeBridge:
                         output = content_val
                     else:
                         output = str(content_val)
+                    output = output.strip()
+                    tool_name = ""
                     if tool_use_id in state.pending_tools:
-                        state.pending_tools[tool_use_id].output_text = output.strip()
+                        state.pending_tools[tool_use_id].output_text = output
+                        tool_name = state.pending_tools[tool_use_id].name
+                    cls._emit_stream_event(emitted, "tool_result", text=output, tool_name=tool_name, tool_use_id=tool_use_id)
 
         elif event_type == "system" and event.get("subtype") == "init":
             session_id = event.get("session_id")
@@ -287,6 +307,8 @@ class ClaudeCodeBridge:
 
         elif event_type == "result":
             result.result_text = (event.get("result") or "").strip()
+            if result.result_text:
+                cls._emit_stream_event(emitted, "result", text=result.result_text)
             session_id = event.get("session_id")
             if session_id:
                 result.session_id = session_id
@@ -471,42 +493,94 @@ class FeishuBot:
             log.exception("Error processing message")
 
     async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
-        """Full message lifecycle: react → streaming cards → done."""
+        """Full message lifecycle: react → incremental card updates → done."""
         await self._react(msg_id, "OK")
         card_id = await self._reply_card(msg_id, "🤔 Thinking...")
-        saw_stream_text = False
+        rendered_blocks: list[str] = []
+        streamed_texts: list[str] = []
+        seen_result_block = False
         result = StreamResult()
 
         try:
             async for event in self.bridge.stream_ask(topic_id, text):
-                if event["type"] == "segment":
-                    saw_stream_text = True
-                    segment_text = self._format_stream_segment(event["segment"].text)
+                if event["type"] == "stream_event":
+                    stream_event = event["event"]
+                    if stream_event.kind == "text":
+                        streamed_texts.append(stream_event.text)
+                    if stream_event.kind == "result":
+                        current_reply = "\n\n".join(streamed_texts).strip()
+                        if not stream_event.text or stream_event.text == current_reply:
+                            seen_result_block = True
+                            continue
+                        seen_result_block = True
+                    block = self._format_stream_event(stream_event)
+                    if not block:
+                        continue
+                    rendered_blocks.append(block)
+                    content = self._format_stream_transcript(rendered_blocks)
                     if card_id:
-                        await self._update_card(card_id, segment_text)
-                        card_id = None
+                        await self._update_card(card_id, content)
                     else:
-                        await self._reply_card(msg_id, segment_text)
+                        card_id = await self._reply_card(msg_id, content)
                 elif event["type"] == "final":
                     result = event["result"]
         except Exception as e:
             log.exception("Bridge error")
             result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
 
-        if not saw_stream_text:
+        if not rendered_blocks:
             card_content = self._format_result(result)
             if card_id:
                 await self._update_card(card_id, card_content)
             else:
                 await self._reply_card(msg_id, card_content)
+        elif result.result_text and not seen_result_block:
+            final_block = self._format_stream_event(StreamEvent(kind="result", text=result.result_text))
+            if final_block:
+                reply_so_far = "\n\n".join(result.assistant_texts).strip()
+                if result.result_text != reply_so_far:
+                    rendered_blocks.append(final_block)
+                    content = self._format_stream_transcript(rendered_blocks)
+                    if card_id:
+                        await self._update_card(card_id, content)
+                    else:
+                        await self._reply_card(msg_id, content)
 
         await self._react(msg_id, "DONE")
 
     @classmethod
-    def _format_stream_segment(cls, text: str) -> str:
-        if len(text) > cls.MAX_REPLY:
-            return text[:cls.MAX_REPLY] + "\n\n... (truncated, response too long)"
-        return text
+    def _format_stream_event(cls, event: StreamEvent) -> str:
+        text = event.text.strip()
+        if event.kind == "thinking":
+            if len(text) > cls.MAX_THINKING:
+                text = text[:cls.MAX_THINKING] + "\n\n... (thinking truncated)"
+            return f"**💭 Thinking**\n> {cls._blockquote(text)}" if text else ""
+        if event.kind == "tool_use":
+            if len(text) > cls.MAX_TOOL_INPUT:
+                text = text[:cls.MAX_TOOL_INPUT] + "..."
+            title = event.tool_name or "unknown"
+            return f"**🔧 Tool Use: {title}**\n`{text}`" if text else f"**🔧 Tool Use: {title}**"
+        if event.kind == "tool_result":
+            if len(text) > cls.MAX_TOOL_OUTPUT:
+                text = text[:cls.MAX_TOOL_OUTPUT] + "..."
+            title = event.tool_name or "unknown"
+            return f"**📦 Tool Result: {title}**\n> {cls._blockquote(text)}" if text else f"**📦 Tool Result: {title}**"
+        if event.kind == "result":
+            if len(text) > cls.MAX_REPLY:
+                text = text[:cls.MAX_REPLY] + "\n\n... (truncated, response too long)"
+            return f"**✅ Result**\n{text}" if text else ""
+        if event.kind == "text":
+            if len(text) > cls.MAX_REPLY:
+                text = text[:cls.MAX_REPLY] + "\n\n... (truncated, response too long)"
+            return text
+        return ""
+
+    @classmethod
+    def _format_stream_transcript(cls, blocks: list[str]) -> str:
+        content = "\n\n---\n\n".join(block for block in blocks if block)
+        if len(content) > cls.MAX_REPLY:
+            return content[:cls.MAX_REPLY] + "\n\n... (truncated, response too long)"
+        return content
 
     @classmethod
     def _format_result(cls, result: StreamResult) -> str:

@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, patch
 from gateway import (
     ClaudeCodeBridge,
     FeishuBot,
+    StreamEvent,
     StreamResult,
-    StreamSegment,
     StreamState,
     ToolCall,
     load_config,
@@ -256,6 +256,19 @@ class TestParseStream(unittest.TestCase):
 class TestFormatResult(unittest.TestCase):
     """Tests for FeishuBot._format_result rich formatting."""
 
+    def test_format_stream_event_variants(self):
+        self.assertIn("💭 Thinking", FeishuBot._format_stream_event(StreamEvent(kind="thinking", text="analyzing")))
+        self.assertIn("🔧 Tool Use: Bash", FeishuBot._format_stream_event(StreamEvent(kind="tool_use", tool_name="Bash", text="pwd")))
+        self.assertIn("📦 Tool Result: Bash", FeishuBot._format_stream_event(StreamEvent(kind="tool_result", tool_name="Bash", text="/repo")))
+        self.assertIn("✅ Result", FeishuBot._format_stream_event(StreamEvent(kind="result", text="done")))
+        self.assertEqual("reply", FeishuBot._format_stream_event(StreamEvent(kind="text", text="reply")))
+
+    def test_format_stream_transcript_joins_blocks(self):
+        output = FeishuBot._format_stream_transcript(["a", "b"])
+        self.assertIn("a", output)
+        self.assertIn("---", output)
+        self.assertIn("b", output)
+
     def test_reply_only(self):
         r = StreamResult(assistant_texts=["Simple answer"])
         output = FeishuBot._format_result(r)
@@ -400,32 +413,47 @@ class TestBuildCmd(unittest.TestCase):
 
 class TestStreamingHelpers(unittest.TestCase):
 
-    def test_consume_stream_line_emits_segment(self):
+    def test_consume_stream_line_emits_text_event(self):
         state = StreamState()
         events = ClaudeCodeBridge._consume_stream_line(
             state,
             json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello"}]}}),
         )
-        self.assertEqual([event["type"] for event in events], ["segment"])
-        self.assertEqual(events[0]["segment"].text, "Hello")
+        self.assertEqual([event["type"] for event in events], ["stream_event"])
+        self.assertEqual(events[0]["event"].kind, "text")
+        self.assertEqual(events[0]["event"].text, "Hello")
         self.assertEqual(state.result.assistant_texts, ["Hello"])
 
-    def test_consume_stream_line_tracks_tool_result(self):
+    def test_consume_stream_line_emits_thinking_tool_and_result_events(self):
         state = StreamState()
-        ClaudeCodeBridge._consume_stream_line(
+        events = ClaudeCodeBridge._consume_stream_line(
             state,
-            json.dumps({"type": "assistant", "message": {"content": [{
-                "type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pwd"}
-            }]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "Need to inspect"},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pwd"}},
+            ]}}),
         )
-        ClaudeCodeBridge._consume_stream_line(
+        self.assertEqual([event["event"].kind for event in events], ["thinking", "tool_use"])
+        result_events = ClaudeCodeBridge._consume_stream_line(
             state,
             json.dumps({"type": "assistant", "message": {"content": [{
                 "type": "tool_result", "tool_use_id": "t1", "content": "repo"
             }]}}),
         )
-        self.assertEqual(len(state.result.tool_calls), 1)
+        self.assertEqual(result_events[0]["event"].kind, "tool_result")
+        self.assertEqual(result_events[0]["event"].tool_name, "Bash")
         self.assertEqual(state.result.tool_calls[0].output_text, "repo")
+
+    def test_consume_stream_line_emits_nonempty_result_event(self):
+        state = StreamState()
+        events = ClaudeCodeBridge._consume_stream_line(
+            state,
+            json.dumps({"type": "result", "result": "Done", "session_id": "sess_1"}),
+        )
+        self.assertEqual([event["type"] for event in events], ["stream_event", "session"])
+        self.assertEqual(events[0]["event"].kind, "result")
+        self.assertEqual(events[0]["event"].text, "Done")
+        self.assertEqual(state.result.session_id, "sess_1")
 
 
 # ===========================================================================
@@ -496,28 +524,53 @@ class TestSessionManagement(unittest.TestCase):
 
 class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
-    async def test_handle_streaming_updates_then_replies(self):
+    async def test_handle_stream_events_patch_same_card(self):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
         async def fake_stream_ask(topic_id, prompt):
-            yield {"type": "segment", "segment": StreamSegment("第一段")}
-            yield {"type": "segment", "segment": StreamSegment("第二段")}
-            yield {"type": "final", "result": StreamResult(assistant_texts=["第一段", "第二段"])}
+            yield {"type": "stream_event", "event": StreamEvent(kind="thinking", text="先思考")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Bash", text="pwd")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Bash", text="/repo")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="text", text="最终回复")}
+            yield {"type": "final", "result": StreamResult(assistant_texts=["最终回复"])}
 
         bot.bridge.stream_ask = fake_stream_ask
-        bot._reply_card = AsyncMock(side_effect=["card_1", None])
+        bot._reply_card = AsyncMock(return_value="card_1")
         bot._update_card = AsyncMock()
         bot._react = AsyncMock()
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        bot._reply_card.assert_any_call("msg", "🤔 Thinking...")
-        bot._update_card.assert_awaited_once_with("card_1", "第一段")
-        bot._reply_card.assert_any_call("msg", "第二段")
+        bot._reply_card.assert_called_once_with("msg", "🤔 Thinking...")
+        self.assertEqual(bot._update_card.await_count, 4)
+        final_content = bot._update_card.await_args_list[-1].args[1]
+        self.assertIn("💭 Thinking", final_content)
+        self.assertIn("🔧 Tool Use: Bash", final_content)
+        self.assertIn("📦 Tool Result: Bash", final_content)
+        self.assertIn("最终回复", final_content)
         self.assertEqual(bot._react.await_count, 2)
 
-    async def test_handle_without_stream_segments_falls_back_to_final_result(self):
+    async def test_handle_skips_duplicate_result_event(self):
+        bridge = ClaudeCodeBridge({})
+        bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
+
+        async def fake_stream_ask(topic_id, prompt):
+            yield {"type": "stream_event", "event": StreamEvent(kind="text", text="同一段回复")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="result", text="同一段回复")}
+            yield {"type": "final", "result": StreamResult(assistant_texts=["同一段回复"], result_text="同一段回复")}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        bot._reply_card = AsyncMock(return_value="card_1")
+        bot._update_card = AsyncMock()
+        bot._react = AsyncMock()
+
+        await bot._handle("chat", "msg", "topic", "hello")
+
+        self.assertEqual(bot._update_card.await_count, 1)
+        self.assertNotIn("✅ Result", bot._update_card.await_args.args[1])
+
+    async def test_handle_without_stream_events_falls_back_to_final_result(self):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
