@@ -171,7 +171,6 @@ class ClaudeCodeBridge:
         self.allowed_tools: str = cfg.get("allowed_tools", "")
         self.instruction: str = cfg.get("instruction", "")
         self.session_store_path: str = cfg.get("session_store_path", ".gateway-sessions.json")
-        self.max_turns: int = cfg.get("max_turns", 50)
         self._session_lock = asyncio.Lock()
         self._sessions: dict[str, str] = self._load_sessions()
 
@@ -236,6 +235,8 @@ class ClaudeCodeBridge:
                             event_types_seen.append("json_err")
                     else:
                         non_json_line_count += 1
+                        if stripped:
+                            log.warning(f"[Bridge] non-JSON line from CLI: {stripped!r}")
                     raw_tail.append(stripped[:300])
                     if len(raw_tail) > 20:
                         raw_tail.pop(0)
@@ -246,7 +247,9 @@ class ClaudeCodeBridge:
                         else:
                             yield event
                 await proc.wait()
+                log.warning(f"[Bridge] process exited: returncode={proc.returncode}")
         except TimeoutError:
+            log.error(f"[Bridge] TIMEOUT after {self.timeout}s, killing process")
             proc.kill()
             await proc.communicate()
             r = StreamResult(assistant_texts=[f"⏰ Claude Code timed out after {self.timeout}s"])
@@ -286,6 +289,7 @@ class ClaudeCodeBridge:
         try:
             event = json.loads(stripped)
         except json.JSONDecodeError:
+            log.warning(f"[Bridge] non-JSON line from CLI: {stripped!r}")
             return []
         return cls._consume_event(state, event)
 
@@ -544,6 +548,13 @@ class ClaudeCodeBridge:
                     json.dumps(event, ensure_ascii=False, default=str)[:3000],
                 )
 
+            log.info(f"[Bridge] result event: stop_reason={event.get('stop_reason')}, "
+                     f"num_turns={event.get('num_turns')}, has_result={bool(event.get('result'))}")
+
+            if event.get("stop_reason") == "tool_use":
+                log.warning(f"[Bridge] CLI stopped mid-tool-use! num_turns={event.get('num_turns')} "
+                            f"session={event.get('session_id')} — model wanted to continue but CLI exited")
+
             if result.result_text:
                 cls._emit_stream_event(emitted, "result", text=result.result_text)
             session_id = event.get("session_id")
@@ -603,12 +614,10 @@ class ClaudeCodeBridge:
     def _build_cmd(self, prompt: str, session_id: str | None) -> list[str]:
         """Build ttadk CLI command list."""
         safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
-        max_turns = self.max_turns
         parts = [
             f"-p {safe(prompt)}",
             "--output-format stream-json",
             "--verbose",
-            f"--max-turns {max_turns}",
         ]
         if session_id:
             parts.insert(0, f"--resume {session_id}")
