@@ -694,13 +694,13 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
             ])}
 
         bot.bridge.stream_ask = fake_stream_ask
-        bot._reply_card = AsyncMock(side_effect=["card-1", "card-2"])
+        bot._reply_card = AsyncMock(side_effect=["card-1", "card-2", "card-3"])
         bot._update_card = AsyncMock()
         bot._react = AsyncMock()
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        self.assertEqual(bot._reply_card.await_count, 2)
+        self.assertEqual(bot._reply_card.await_count, 3)
         rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
         self.assertIn("🔧 Tool Use: Read", rendered_contents[0])
         self.assertIn("🔧 Tool Use: Read", rendered_contents[1])
@@ -723,13 +723,13 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
             ])}
 
         bot.bridge.stream_ask = fake_stream_ask
-        bot._reply_card = AsyncMock(side_effect=[None, "fallback-card"])
+        bot._reply_card = AsyncMock(side_effect=[None, "fallback-card", "final-card"])
         bot._update_card = AsyncMock()
         bot._react = AsyncMock()
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        self.assertEqual(bot._reply_card.await_count, 2)
+        self.assertEqual(bot._reply_card.await_count, 3)
         first_card = bot._reply_card.await_args_list[0].args[1]
         second_card = bot._reply_card.await_args_list[1].args[1]
         self.assertIn("🔧 Tool Use: Bash", first_card)
@@ -1137,3 +1137,165 @@ class TestStderrSeparation(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRedactedThinking(unittest.TestCase):
+    """Tests for redacted_thinking block handling."""
+
+    def test_redacted_thinking_block_skipped_silently(self):
+        """redacted_thinking blocks should be silently skipped, not emitted or warned."""
+        state = StreamState()
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Hello"},
+                    {"type": "redacted_thinking", "data": "enc_gAAAAA_encrypted_blob"},
+                ]
+            },
+        }
+        emitted = ClaudeCodeBridge._consume_event(state, event)
+        # Only the text block should produce a stream event
+        stream_events = [e for e in emitted if e["type"] == "stream_event"]
+        self.assertEqual(len(stream_events), 1)
+        self.assertEqual(stream_events[0]["event"].kind, "text")
+        self.assertEqual(stream_events[0]["event"].text, "Hello")
+        # assistant_texts should only contain the text block
+        self.assertEqual(state.result.assistant_texts, ["Hello"])
+
+    def test_redacted_thinking_no_unknown_warning(self):
+        """redacted_thinking should NOT trigger the UNKNOWN block warning."""
+        state = StreamState()
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "redacted_thinking", "data": "enc_gAAAAA_encrypted_blob"},
+                ]
+            },
+        }
+        with patch("gateway.log") as mock_log:
+            ClaudeCodeBridge._consume_event(state, event)
+            # Check no warning calls contain "UNKNOWN"
+            for call in mock_log.warning.call_args_list:
+                self.assertNotIn("UNKNOWN", str(call), "redacted_thinking should not trigger UNKNOWN warning")
+
+    def test_redacted_thinking_only_event_produces_empty_texts(self):
+        """Assistant event with only redacted_thinking should not add to assistant_texts."""
+        state = StreamState()
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "redacted_thinking", "data": "encrypted_content"},
+                ]
+            },
+        }
+        ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(state.result.assistant_texts, [])
+        self.assertEqual(state.result.thinking, [])
+
+
+class TestToolUseFallbackReply(unittest.TestCase):
+    """Tests for fallback reply when tool_calls exist but no text."""
+
+    def test_reply_text_fallback_with_tool_calls(self):
+        """When result_text and assistant_texts are empty but tool_calls exist, reply_text should provide fallback."""
+        result = StreamResult(
+            tool_calls=[ToolCall(name="Bash", input_text="ls")],
+        )
+        self.assertNotEqual(result.reply_text, "")
+        self.assertIn("Bash", result.reply_text)
+        self.assertIn("⚠️", result.reply_text)
+
+    def test_reply_text_prefers_result_text_over_fallback(self):
+        """result_text takes priority even when tool_calls exist."""
+        result = StreamResult(
+            result_text="Done!",
+            tool_calls=[ToolCall(name="Bash", input_text="ls")],
+        )
+        self.assertEqual(result.reply_text, "Done!")
+
+    def test_reply_text_prefers_assistant_texts_over_fallback(self):
+        """assistant_texts takes priority over tool_calls fallback."""
+        result = StreamResult(
+            assistant_texts=["Here is the result"],
+            tool_calls=[ToolCall(name="Bash", input_text="ls")],
+        )
+        self.assertEqual(result.reply_text, "Here is the result")
+
+    def test_reply_text_empty_when_nothing(self):
+        """reply_text should be empty when nothing is available."""
+        result = StreamResult()
+        self.assertEqual(result.reply_text, "")
+
+    def test_reply_text_fallback_multiple_tools(self):
+        """Fallback message should list multiple tool names."""
+        result = StreamResult(
+            tool_calls=[
+                ToolCall(name="Bash", input_text="ls"),
+                ToolCall(name="Read", input_text="file.py"),
+                ToolCall(name="Edit", input_text="fix.py"),
+            ],
+        )
+        text = result.reply_text
+        self.assertIn("Bash", text)
+        self.assertIn("Read", text)
+        self.assertIn("Edit", text)
+
+    def test_reply_text_fallback_many_tools_truncated(self):
+        """When >5 tools, fallback should show count."""
+        result = StreamResult(
+            tool_calls=[ToolCall(name=f"Tool{i}", input_text="x") for i in range(8)],
+        )
+        text = result.reply_text
+        self.assertIn("8", text)
+
+    def test_is_empty_false_with_tool_calls(self):
+        """is_empty should be False when tool_calls exist (even without text)."""
+        result = StreamResult(
+            tool_calls=[ToolCall(name="Bash", input_text="ls")],
+        )
+        # With the new fallback, reply_text is non-empty so is_empty is False
+        self.assertFalse(result.is_empty)
+
+
+class TestStopReasonCapture(unittest.TestCase):
+    """Tests for stop_reason capture in StreamResult."""
+
+    def test_stop_reason_captured_from_result_event(self):
+        """stop_reason from the result event should be stored in StreamResult."""
+        state = StreamState()
+        event = {
+            "type": "result",
+            "result": "",
+            "stop_reason": "tool_use",
+            "num_turns": 1,
+            "session_id": "sess_abc",
+        }
+        ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(state.result.stop_reason, "tool_use")
+
+    def test_stop_reason_none_when_normal(self):
+        """stop_reason should be None when not set in event."""
+        state = StreamState()
+        event = {
+            "type": "result",
+            "result": "All done.",
+            "session_id": "sess_abc",
+        }
+        ClaudeCodeBridge._consume_event(state, event)
+        self.assertIsNone(state.result.stop_reason)
+
+    def test_stop_reason_end_turn(self):
+        """stop_reason=end_turn should be captured normally."""
+        state = StreamState()
+        event = {
+            "type": "result",
+            "result": "Done.",
+            "stop_reason": "end_turn",
+            "num_turns": 5,
+        }
+        ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(state.result.stop_reason, "end_turn")
+        self.assertEqual(state.result.result_text, "Done.")

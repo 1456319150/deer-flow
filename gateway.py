@@ -132,16 +132,30 @@ class StreamResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     assistant_texts: list[str] = field(default_factory=list)
     result_text: str = ""
+    stop_reason: str | None = None
     session_id: str | None = None
     usage: UsageSummary | None = None
 
     @property
     def reply_text(self) -> str:
-        """Primary text to show: result if present, else combined assistant texts."""
+        """Primary text to show: result if present, else combined assistant texts.
+
+        When stop_reason is tool_use and no text is available, synthesize a
+        fallback message so the user is never left with a blank reply.
+        """
         if self.result_text:
             return self.result_text
         if self.assistant_texts:
             return "\n\n".join(self.assistant_texts)
+        # Fallback: model requested tool use but CLI exited before producing text
+        if self.tool_calls:
+            names = ", ".join(tc.name for tc in self.tool_calls[:5])
+            remaining = len(self.tool_calls) - 5
+            suffix = f" 等 {remaining + 5} 个工具" if remaining > 0 else ""
+            return (
+                f"⚠️ Claude Code 请求执行工具 ({names}{suffix}) 但未返回最终回复。\n"
+                f"这通常是因为 CLI 在工具执行前退出。请重试，或检查网关日志获取详情。"
+            )
         return ""
 
     @property
@@ -528,6 +542,10 @@ class ClaudeCodeBridge:
                         tool_name = state.pending_tools[tool_use_id].name
                     cls._emit_stream_event(emitted, "tool_result", text=output, tool_name=tool_name, tool_use_id=tool_use_id)
 
+                elif block_type == "redacted_thinking":
+                    # Extended thinking encrypted block — safe to skip silently
+                    log.debug("[Bridge] redacted_thinking block (encrypted extended thinking) — skipped")
+
                 else:
                     log.warning("[Bridge] UNKNOWN block type=%r in assistant event — keys=%s preview=%s",
                                 block_type, list(block.keys())[:10],
@@ -555,6 +573,7 @@ class ClaudeCodeBridge:
 
         elif event_type == "result":
             result.result_text = (event.get("result") or "").strip()
+            result.stop_reason = event.get("stop_reason")
             result.usage = cls._extract_usage_summary(event)
             log.info(
                 "[BridgeResult] result_len=%d preview=%r session=%s",
