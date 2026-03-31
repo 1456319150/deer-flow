@@ -195,7 +195,7 @@ async def qr_login(baseurl: str = ILINK_DEFAULT_BASE) -> WeixinAccount:
                 f"{baseurl}/ilink/bot/get_qrcode_status?qrcode={qr_key}",
                 headers=_headers(),
             ) as resp:
-                status_data = await resp.json()
+                status_data = await resp.json(content_type=None)
 
             if status_data.get("bot_token"):
                 log.info("✅ 微信登录成功!")
@@ -215,7 +215,7 @@ async def qr_login(baseurl: str = ILINK_DEFAULT_BASE) -> WeixinAccount:
                     f"{baseurl}/ilink/bot/get_bot_qrcode?bot_type=3",
                     headers=_headers(),
                 ) as resp:
-                    data = await resp.json()
+                    data = await resp.json(content_type=None)
                 qr_key = data.get("qrcode", "")
                 qr_url = data.get("qrcode_img_content", "")
                 log.info("新二维码: %s", qr_url)
@@ -390,7 +390,7 @@ class WeixinChannel:
             json={"get_updates_buf": self.sync_cursor.buf, "base_info": _base_info()},
             headers=_headers(self.account.bot_token),
         ) as resp:
-            data = await resp.json()
+            data = await resp.json(content_type=None)
 
         # Check for session expiry
         errcode = data.get("errcode", 0)
@@ -471,7 +471,7 @@ class WeixinChannel:
                 headers=_headers(self.account.bot_token),
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                last_result = await resp.json()
+                last_result = await resp.json(content_type=None)
 
             if len(chunks) > 1:
                 await asyncio.sleep(0.5)  # Rate limit between chunks
@@ -497,7 +497,7 @@ class WeixinChannel:
                 headers=_headers(self.account.bot_token),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                config = await resp.json()
+                config = await resp.json(content_type=None)
 
             ticket = config.get("typing_ticket")
             if not ticket:
@@ -514,7 +514,7 @@ class WeixinChannel:
                 headers=_headers(self.account.bot_token),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                await resp.json()
+                await resp.json(content_type=None)
         except Exception:
             log.debug("Typing indicator failed", exc_info=True)
 

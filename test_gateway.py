@@ -521,6 +521,20 @@ class TestBuildCmd(unittest.TestCase):
         bridge = ClaudeCodeBridge({"model": "gpt-5.4", "target": "claude", "provider": "codex"})
         self.assertEqual(bridge.provider, "codex")
 
+    def test_codex_cmd_uses_exec_json(self):
+        bridge = ClaudeCodeBridge({"model": "gpt-5.4", "target": "codex"})
+        cmd = bridge._build_cmd("hello", None)
+        args_str = " ".join(cmd)
+        self.assertIn("exec --yolo --json", args_str)
+        self.assertNotIn("--full-auto", args_str)
+        self.assertNotIn("--output-format stream-json", args_str)
+
+    def test_codex_resume_cmd(self):
+        bridge = ClaudeCodeBridge({"model": "gpt-5.4", "target": "codex"})
+        cmd = bridge._build_cmd("continue", "thread_123")
+        args_str = " ".join(cmd)
+        self.assertIn("exec --yolo --json resume thread_123", args_str)
+
 
 class TestStreamingHelpers(unittest.TestCase):
 
@@ -579,12 +593,76 @@ class TestStreamingHelpers(unittest.TestCase):
         state = StreamState()
         events = ClaudeCodeBridge._consume_stream_line(
             state,
-            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello"}]}}),
+            json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "Hello"}}),
             provider="codex",
         )
         self.assertEqual([event["type"] for event in events], ["stream_event"])
         self.assertEqual(events[0]["event"].kind, "text")
         self.assertEqual(state.result.assistant_texts, ["Hello"])
+
+
+class TestCodexStreaming(unittest.TestCase):
+
+    def test_parse_codex_stream_with_command(self):
+        raw = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "thread_1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {
+                "id": "item_0",
+                "type": "agent_message",
+                "text": "Running pwd.",
+            }}),
+            json.dumps({"type": "item.started", "item": {
+                "id": "item_1",
+                "type": "command_execution",
+                "command": "/bin/bash -lc pwd",
+                "aggregated_output": "",
+                "exit_code": None,
+                "status": "in_progress",
+            }}),
+            json.dumps({"type": "item.completed", "item": {
+                "id": "item_1",
+                "type": "command_execution",
+                "command": "/bin/bash -lc pwd",
+                "aggregated_output": "/repo\n",
+                "exit_code": 0,
+                "status": "completed",
+            }}),
+            json.dumps({"type": "item.completed", "item": {
+                "id": "item_2",
+                "type": "agent_message",
+                "text": "/repo",
+            }}),
+            json.dumps({"type": "turn.completed", "usage": {
+                "input_tokens": 10,
+                "cached_input_tokens": 4,
+                "output_tokens": 3,
+            }}),
+        ])
+        result = ClaudeCodeBridge._parse_stream(raw, provider="codex")
+        self.assertEqual(result.session_id, "thread_1")
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertEqual(result.assistant_texts, ["Running pwd.", "/repo"])
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "command_execution")
+        self.assertEqual(result.tool_calls[0].input_text, "/bin/bash -lc pwd")
+        self.assertEqual(result.tool_calls[0].output_text, "/repo")
+        self.assertIsNotNone(result.usage)
+        self.assertEqual(result.usage.input_tokens, 10)
+        self.assertEqual(result.usage.cache_read_input_tokens, 4)
+        self.assertEqual(result.usage.output_tokens, 3)
+        self.assertEqual(result.usage.total_tokens, 17)
+
+    def test_consume_codex_turn_failed(self):
+        state = StreamState()
+        events = ClaudeCodeBridge._consume_event(
+            state,
+            {"type": "turn.failed", "message": "Something broke."},
+            provider="codex",
+        )
+        self.assertEqual(state.result.stop_reason, "error")
+        self.assertEqual(state.result.result_text, "Something broke.")
+        self.assertEqual([event["event"].kind for event in events], ["result"])
 
 
 # ===========================================================================
@@ -1156,6 +1234,39 @@ class TestStderrSeparation(unittest.IsolatedAsyncioTestCase):
 
         final_events = [e for e in events if e["type"] == "final"]
         self.assertEqual(len(final_events), 1)
+        self.assertIn("timed out", final_events[0]["result"].reply_text)
+
+    async def test_timeout_returns_final_without_communicate(self):
+        """Timeout should still return a final result even if communicate would hang."""
+        bridge = ClaudeCodeBridge({"timeout": 1})
+
+        class HangingStream:
+            async def readline(self):
+                await asyncio.sleep(100)
+                return b""
+
+        class FakeProc:
+            def __init__(self):
+                self.stdout = HangingStream()
+                self.stderr = HangingStream()
+                self.returncode = -9
+                self.killed = False
+            async def wait(self):
+                return None
+            def kill(self):
+                self.killed = True
+            async def communicate(self):
+                raise AssertionError("communicate should not be called on timeout")
+
+        proc = FakeProc()
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            events = []
+            async for event in bridge.stream_ask("topic1", "hello"):
+                events.append(event)
+
+        final_events = [e for e in events if e["type"] == "final"]
+        self.assertEqual(len(final_events), 1)
+        self.assertTrue(proc.killed)
         self.assertIn("timed out", final_events[0]["result"].reply_text)
 
 

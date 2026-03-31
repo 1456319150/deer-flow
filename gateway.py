@@ -156,7 +156,7 @@ class StreamResult:
             remaining = len(self.tool_calls) - 5
             suffix = f" 等 {remaining + 5} 个工具" if remaining > 0 else ""
             return (
-                f"⚠️ Claude Code 请求执行工具 ({names}{suffix}) 但未返回最终回复。\n"
+                f"⚠️ CLI 请求执行工具 ({names}{suffix}) 但未返回最终回复。\n"
                 f"这通常是因为 CLI 在工具执行前退出。请重试，或检查网关日志获取详情。"
             )
         return ""
@@ -291,6 +291,7 @@ class ClaudeCodeBridge:
         event_types_seen: list[str] = []
         raw_tail: list[str] = []  # last 20 lines (truncated to 300 chars each)
 
+        stderr_task: asyncio.Task[None] | None = None
         try:
             async with asyncio.timeout(self.timeout):
                 assert proc.stdout is not None
@@ -341,13 +342,16 @@ class ClaudeCodeBridge:
                         else:
                             yield event
                 await proc.wait()
-                await stderr_task  # ensure stderr is fully drained
+                if stderr_task is not None:
+                    await stderr_task
                 log.warning(f"[Bridge] process exited: returncode={proc.returncode}")
         except TimeoutError:
             log.error(f"[Bridge] TIMEOUT after {self.timeout}s, killing process")
-            stderr_task.cancel()
+            if stderr_task is not None:
+                stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
             proc.kill()
-            await proc.communicate()
+            await proc.wait()
             r = StreamResult(assistant_texts=[f"⏰ Claude Code timed out after {self.timeout}s"])
             yield {"type": "final", "result": r}
             return
@@ -741,7 +745,104 @@ class ClaudeCodeBridge:
 
     @classmethod
     def _consume_event_codex(cls, state: StreamState, event: dict[str, Any]) -> list[dict[str, Any]]:
-        return cls._consume_event_claude(state, event)
+        emitted: list[dict[str, Any]] = []
+        result = state.result
+        event_type = event.get("type")
+
+        if event_type == "thread.started":
+            session_id = event.get("thread_id")
+            if session_id:
+                result.session_id = session_id
+                emitted.append({"type": "session", "session_id": session_id})
+
+        elif event_type == "item.started":
+            item = event.get("item", {})
+            emitted.extend(cls._consume_codex_item(state, item, completed=False))
+
+        elif event_type == "item.completed":
+            item = event.get("item", {})
+            emitted.extend(cls._consume_codex_item(state, item, completed=True))
+
+        elif event_type == "turn.completed":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                result.usage = UsageSummary(
+                    input_tokens=cls._coerce_int(usage.get("input_tokens")),
+                    output_tokens=cls._coerce_int(usage.get("output_tokens")),
+                    cache_read_input_tokens=cls._coerce_int(usage.get("cached_input_tokens")),
+                    total_tokens=cls._coerce_int(usage.get("total_tokens")),
+                )
+                if result.usage and not result.usage.total_tokens:
+                    result.usage.total_tokens = sum(
+                        value or 0 for value in (
+                            result.usage.input_tokens,
+                            result.usage.output_tokens,
+                            result.usage.cache_read_input_tokens,
+                        )
+                    )
+            result.stop_reason = result.stop_reason or "end_turn"
+
+        elif event_type == "turn.failed":
+            result.stop_reason = "error"
+            message = event.get("message") or event.get("error") or "Codex turn failed."
+            result.result_text = str(message).strip()
+            if result.result_text:
+                cls._emit_stream_event(emitted, "result", text=result.result_text)
+
+        elif event_type is not None:
+            log.warning(
+                "[BridgeEvent] UNRECOGNIZED codex event type=%r keys=%s preview=%s",
+                event_type,
+                list(event.keys())[:15],
+                json.dumps(event, ensure_ascii=False, default=str)[:500],
+            )
+
+        return emitted
+
+    @classmethod
+    def _consume_codex_item(
+        cls,
+        state: StreamState,
+        item: dict[str, Any],
+        completed: bool,
+    ) -> list[dict[str, Any]]:
+        emitted: list[dict[str, Any]] = []
+        result = state.result
+        item_type = item.get("type")
+        item_id = item.get("id", "")
+
+        if item_type == "agent_message":
+            text = str(item.get("text") or "").strip()
+            if text:
+                result.assistant_texts.append(text)
+                cls._emit_stream_event(emitted, "text", text=text)
+            return emitted
+
+        if item_type == "command_execution":
+            command = str(item.get("command") or "").strip()
+            if completed:
+                output = cls._stringify_tool_result_content(item.get("aggregated_output", ""))
+                tool_name = ""
+                if item_id in state.pending_tools:
+                    state.pending_tools[item_id].output_text = output
+                    tool_name = state.pending_tools[item_id].name
+                elif command:
+                    tc = ToolCall(name="command_execution", input_text=command, output_text=output)
+                    result.tool_calls.append(tc)
+                    if item_id:
+                        state.pending_tools[item_id] = tc
+                    tool_name = tc.name
+                cls._emit_stream_event(emitted, "tool_result", text=output, tool_name=tool_name, tool_use_id=item_id)
+                return emitted
+
+            tc = ToolCall(name="command_execution", input_text=command)
+            result.tool_calls.append(tc)
+            if item_id:
+                state.pending_tools[item_id] = tc
+            cls._emit_stream_event(emitted, "tool_use", text=command, tool_name=tc.name, tool_use_id=item_id)
+            return emitted
+
+        return emitted
 
     @staticmethod
     def _parse_stream(raw: str, provider: str = "claude") -> StreamResult:
@@ -801,7 +902,12 @@ class ClaudeCodeBridge:
         return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
 
     def _build_cmd_codex(self, prompt: str, session_id: str | None) -> list[str]:
-        return self._build_cmd_claude(prompt, session_id)
+        safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
+        if session_id:
+            parts = ["exec", "--yolo", "--json", "resume", session_id, safe(prompt)]
+        else:
+            parts = ["exec", "--yolo", "--json", safe(prompt)]
+        return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
 
 
 # ===========================================================================

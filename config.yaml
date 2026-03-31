@@ -8,7 +8,7 @@ feishu:
 claude:
   ttadk_cmd: ttadk           # or full path: /usr/local/bin/ttadk
   model: gpt-5.4
-  target: claude
+  target: codex
   timeout: 600               # seconds
   session_store_path: .gateway-sessions.json
   # allowed_tools: "Bash,Read,Write,Edit,Glob,WebSearch,WebFetch"
@@ -18,7 +18,7 @@ claude:
 # First run: python weixin_login.py (scan QR code to save credentials)
 # Then set enabled: true and restart gateway
 weixin:
-  enabled: false
+  enabled: true
   auto_login: false
   account_path: .weixin-account.json
   context_tokens_path: .weixin-context-tokens.json
