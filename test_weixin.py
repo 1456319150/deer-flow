@@ -29,7 +29,7 @@ class _FakeResponse:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def json(self):
+    async def json(self, **kwargs):
         return self.payload
 
 
@@ -278,6 +278,83 @@ class TestWeixinBot(unittest.IsolatedAsyncioTestCase):
         self.assertIn("输出 tokens: 34", second_call[2])
         self.assertIn("总 tokens: 1,234", second_call[2])
         self.assertIn("金额: $0.0165", second_call[2])
+
+    async def test_new_command_resets_session(self):
+        bridge = ClaudeCodeBridge({})
+        bridge._sessions["wx_user-1"] = "sess_123"
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+        msg = type("Msg", (), {
+            "msg_id": "msg-new",
+            "timestamp": time.time(),
+            "text": "/new",
+            "from_user": "user-1",
+            "context_token": "ctx-1",
+            "is_empty": False,
+        })()
+
+        await bot._handle_message(msg)
+
+        self.assertIsNone(bridge.get_session("wx_user-1"))
+        bot._channel.send_typing.assert_not_awaited()
+        bot._channel.send_text.assert_awaited_once()
+        self.assertIn("已重置当前会话", bot._channel.send_text.await_args.args[2])
+        self.assertIn("sess_123", bot._channel.send_text.await_args.args[2])
+
+    async def test_session_command_reports_current_session(self):
+        bridge = ClaudeCodeBridge({})
+        bridge._sessions["wx_user-1"] = "sess_123"
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+        msg = type("Msg", (), {
+            "msg_id": "msg-session",
+            "timestamp": time.time(),
+            "text": "/session",
+            "from_user": "user-1",
+            "context_token": "ctx-1",
+            "is_empty": False,
+        })()
+
+        await bot._handle_message(msg)
+
+        bot._channel.send_typing.assert_not_awaited()
+        bot._channel.send_text.assert_awaited_once_with("user-1", "ctx-1", "当前 session: sess_123")
+
+    async def test_session_command_when_empty(self):
+        bridge = ClaudeCodeBridge({})
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+        msg = type("Msg", (), {
+            "msg_id": "msg-session-empty",
+            "timestamp": time.time(),
+            "text": "/session",
+            "from_user": "user-1",
+            "context_token": "ctx-1",
+            "is_empty": False,
+        })()
+
+        await bot._handle_message(msg)
+
+        bot._channel.send_text.assert_awaited_once_with("user-1", "ctx-1", "当前还没有活动会话。")
+
+    async def test_reset_alias_supported(self):
+        bridge = ClaudeCodeBridge({})
+        bridge._sessions["wx_user-1"] = "sess_123"
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+        msg = type("Msg", (), {
+            "msg_id": "msg-reset",
+            "timestamp": time.time(),
+            "text": "/reset",
+            "from_user": "user-1",
+            "context_token": "ctx-1",
+            "is_empty": False,
+        })()
+
+        await bot._handle_message(msg)
+
+        self.assertIsNone(bridge.get_session("wx_user-1"))
+        bot._channel.send_text.assert_awaited_once()
 
     async def test_handle_message_skips_duplicate_ids(self):
         bridge = ClaudeCodeBridge({})

@@ -873,6 +873,19 @@ class ClaudeCodeBridge:
             await asyncio.to_thread(self._save_sessions)
         log.info("[Bridge] session: topic=%s → %s", topic_id, session_id)
 
+    def get_session(self, topic_id: str) -> str | None:
+        return self._sessions.get(topic_id)
+
+    async def reset_session(self, topic_id: str) -> str | None:
+        if not topic_id:
+            return None
+        async with self._session_lock:
+            session_id = self._sessions.pop(topic_id, None)
+            await asyncio.to_thread(self._save_sessions)
+        if session_id:
+            log.info("[Bridge] session reset: topic=%s old_session=%s", topic_id, session_id)
+        return session_id
+
     def _save_sessions(self) -> None:
         directory = os.path.dirname(self.session_store_path)
         if directory:

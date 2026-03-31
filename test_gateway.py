@@ -707,6 +707,19 @@ class TestSessionPersistence(unittest.TestCase):
             self.assertEqual(json.load(f), {"topic1": "sess_a"})
         os.unlink(path)
 
+    def test_reset_session_persists(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            path = f.name
+        os.unlink(path)
+        bridge = ClaudeCodeBridge({"session_store_path": path})
+        asyncio.run(bridge._remember_session("topic1", "sess_a"))
+        cleared = asyncio.run(bridge.reset_session("topic1"))
+        self.assertEqual(cleared, "sess_a")
+        self.assertIsNone(bridge.get_session("topic1"))
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {})
+        os.unlink(path)
+
 
 # ===========================================================================
 # Session Management

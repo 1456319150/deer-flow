@@ -131,10 +131,16 @@ class WeixinBot:
 
         log.info("[WeixinBot] 收到消息 from=%s text=%r", from_user, text[:100])
 
-        # Use from_user as topic_id (each WeChat user = one conversation thread)
         topic_id = f"wx_{from_user}"
 
-        # Show typing
+        control_reply = await self._handle_control_command(topic_id, text)
+        if control_reply is not None:
+            plain = strip_markdown(control_reply)
+            log.info("[WeixinBot] 发送控制回复 to=%s len=%d preview=%r",
+                     from_user, len(plain), _preview_text(plain))
+            await self._channel.send_text(from_user, ctx_token, plain)
+            return
+
         if ctx_token:
             await self._channel.send_typing(from_user, ctx_token, typing=True)
 
@@ -168,6 +174,20 @@ class WeixinBot:
         # Cancel typing
         if ctx_token:
             await self._channel.send_typing(from_user, ctx_token, typing=False)
+
+    async def _handle_control_command(self, topic_id: str, text: str) -> str | None:
+        normalized = text.strip()
+        if normalized not in {"/new", "/reset", "/session"}:
+            return None
+        if normalized in {"/new", "/reset"}:
+            old_session = await self.bridge.reset_session(topic_id)
+            if old_session:
+                return f"已重置当前会话。\n旧 session: {old_session}\n下一条消息会开启新会话。"
+            return "当前还没有活动会话。\n下一条消息会开启新会话。"
+        session_id = self.bridge.get_session(topic_id)
+        if session_id:
+            return f"当前 session: {session_id}"
+        return "当前还没有活动会话。"
 
     async def _process_with_streaming(
         self, topic_id: str, text: str, from_user: str, ctx_token: str
