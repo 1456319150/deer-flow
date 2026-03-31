@@ -195,7 +195,7 @@ class ClaudeCodeBridge:
                 *cmd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stderr=asyncio.subprocess.PIPE,  # separate pipe
                 limit=10 * 1024 * 1024,  # 10MB; default 64KB too small for Claude Code output
             )
         except FileNotFoundError:
@@ -215,6 +215,21 @@ class ClaudeCodeBridge:
         try:
             async with asyncio.timeout(self.timeout):
                 assert proc.stdout is not None
+                # Drain stderr concurrently — log each line with [STDERR] prefix
+                stderr_lines: list[str] = []
+
+                async def _drain_stderr():
+                    assert proc.stderr is not None
+                    while True:
+                        line = await proc.stderr.readline()
+                        if not line:
+                            break
+                        text = line.decode("utf-8", errors="replace").strip()
+                        if text:
+                            stderr_lines.append(text)
+                            log.warning("[Bridge] [STDERR] %s", text)
+
+                stderr_task = asyncio.create_task(_drain_stderr())
                 while True:
                     line = await proc.stdout.readline()
                     if not line:
@@ -236,7 +251,7 @@ class ClaudeCodeBridge:
                     else:
                         non_json_line_count += 1
                         if stripped:
-                            log.warning(f"[Bridge] non-JSON line from CLI: {stripped!r}")
+                            log.debug(f"[Bridge] non-JSON stdout line: {stripped!r}")
                     raw_tail.append(stripped[:300])
                     if len(raw_tail) > 20:
                         raw_tail.pop(0)
@@ -247,9 +262,11 @@ class ClaudeCodeBridge:
                         else:
                             yield event
                 await proc.wait()
+                await stderr_task  # ensure stderr is fully drained
                 log.warning(f"[Bridge] process exited: returncode={proc.returncode}")
         except TimeoutError:
             log.error(f"[Bridge] TIMEOUT after {self.timeout}s, killing process")
+            stderr_task.cancel()
             proc.kill()
             await proc.communicate()
             r = StreamResult(assistant_texts=[f"⏰ Claude Code timed out after {self.timeout}s"])
@@ -258,8 +275,8 @@ class ClaudeCodeBridge:
 
         # DIAG: enhanced exit log with line counters and event type summary
         log.info(
-            "[Bridge] exit=%d output=%d chars json_lines=%d non_json_lines=%d event_types=%s",
-            proc.returncode, output_len, json_line_count, non_json_line_count, event_types_seen,
+            "[Bridge] exit=%d output=%d chars json_lines=%d non_json_lines=%d stderr_lines=%d event_types=%s",
+            proc.returncode, output_len, json_line_count, non_json_line_count, len(stderr_lines), event_types_seen,
         )
 
         # DIAG: dump raw tail when result is empty — this is the key diagnostic
@@ -271,6 +288,10 @@ class ClaudeCodeBridge:
             log.warning("[Bridge] EMPTY RESULT — dumping last %d raw output lines:", len(raw_tail))
             for i, rl in enumerate(raw_tail):
                 log.warning("[Bridge] raw_tail[%02d]: %s", i, rl)
+            if stderr_lines:
+                log.warning("[Bridge] EMPTY RESULT — stderr output (%d lines):", len(stderr_lines))
+                for i, sl in enumerate(stderr_lines[-20:]):
+                    log.warning("[Bridge] stderr[%02d]: %s", i, sl[:500])
 
         if state.result.session_id:
             await self._remember_session(topic_id, state.result.session_id)
@@ -289,7 +310,7 @@ class ClaudeCodeBridge:
         try:
             event = json.loads(stripped)
         except json.JSONDecodeError:
-            log.warning(f"[Bridge] non-JSON line from CLI: {stripped!r}")
+            log.debug(f"[Bridge] non-JSON line in stream: {stripped!r}")
             return []
         return cls._consume_event(state, event)
 

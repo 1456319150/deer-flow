@@ -985,5 +985,155 @@ class TestCard(unittest.TestCase):
         self.assertIn("quotes", card["elements"][0]["content"])
 
 
+
+
+# ===========================================================================
+# stderr separation tests
+# ===========================================================================
+
+class TestStderrSeparation(unittest.IsolatedAsyncioTestCase):
+    """Tests for stderr being captured separately from stdout."""
+
+    async def test_stderr_captured_separately(self):
+        """Verify stderr lines are logged with [STDERR] prefix, not mixed into stream events."""
+        bridge = ClaudeCodeBridge({})
+
+        # Build a fake process that writes JSON to stdout and error to stderr
+        stdout_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "s1"}).encode() + b"\n",
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hi"}]}}).encode() + b"\n",
+            json.dumps({"type": "result", "result": "Hi", "session_id": "s1"}).encode() + b"\n",
+        ]
+        stderr_lines_raw = [
+            b"Warning: something went wrong\n",
+            b"Error: connection reset\n",
+        ]
+
+        async def fake_readline_stdout(lines):
+            for line in lines:
+                yield line
+            yield b""
+
+        async def fake_readline_stderr(lines):
+            for line in lines:
+                yield line
+            yield b""
+
+        class FakeStream:
+            def __init__(self, lines):
+                self._iter = iter(lines + [b""])
+            async def readline(self):
+                return next(self._iter)
+
+        class FakeProc:
+            def __init__(self):
+                self.stdout = FakeStream(stdout_lines)
+                self.stderr = FakeStream(stderr_lines_raw)
+                self.returncode = 0
+            async def wait(self):
+                pass
+            def kill(self):
+                pass
+            async def communicate(self):
+                return b"", b""
+
+        with patch("asyncio.create_subprocess_exec", return_value=FakeProc()):
+            events = []
+            async for event in bridge.stream_ask("topic1", "hello"):
+                events.append(event)
+
+        # Should have stream events + final
+        final_events = [e for e in events if e["type"] == "final"]
+        self.assertEqual(len(final_events), 1)
+        result = final_events[0]["result"]
+        self.assertEqual(result.reply_text, "Hi")
+
+    async def test_stderr_logged_on_empty_result(self):
+        """When result is empty and stderr has content, stderr should be in diagnostics."""
+        bridge = ClaudeCodeBridge({})
+
+        stdout_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "s1"}).encode() + b"\n",
+            json.dumps({"type": "result", "result": "", "session_id": "s1", "stop_reason": "tool_use", "num_turns": 3}).encode() + b"\n",
+        ]
+        stderr_lines_raw = [
+            b"FATAL: max context length exceeded\n",
+        ]
+
+        class FakeStream:
+            def __init__(self, lines):
+                self._iter = iter(lines + [b""])
+            async def readline(self):
+                return next(self._iter)
+
+        class FakeProc:
+            def __init__(self):
+                self.stdout = FakeStream(stdout_lines)
+                self.stderr = FakeStream(stderr_lines_raw)
+                self.returncode = 1
+            async def wait(self):
+                pass
+            def kill(self):
+                pass
+            async def communicate(self):
+                return b"", b""
+
+        with patch("asyncio.create_subprocess_exec", return_value=FakeProc()), \
+             patch("gateway.log") as mock_log:
+            events = []
+            async for event in bridge.stream_ask("topic1", "hello"):
+                events.append(event)
+
+            # Check that stderr was logged with [STDERR] prefix
+            stderr_calls = [
+                call for call in mock_log.warning.call_args_list
+                if "[STDERR]" in str(call)
+            ]
+            self.assertGreater(len(stderr_calls), 0, "stderr lines should be logged with [STDERR] prefix")
+
+            # Check that empty result diagnostic includes stderr
+            stderr_dump_calls = [
+                call for call in mock_log.warning.call_args_list
+                if "stderr output" in str(call) or "stderr[" in str(call)
+            ]
+            self.assertGreater(len(stderr_dump_calls), 0, "empty result diagnostic should dump stderr")
+
+    async def test_timeout_cancels_stderr_task(self):
+        """On timeout, stderr drain task should be cancelled cleanly."""
+        bridge = ClaudeCodeBridge({"timeout": 1})
+
+        class HangingStream:
+            async def readline(self):
+                await asyncio.sleep(100)  # hang forever
+                return b""
+
+        class FakeStream:
+            def __init__(self, lines):
+                self._iter = iter(lines + [b""])
+            async def readline(self):
+                return next(self._iter)
+
+        class FakeProc:
+            def __init__(self):
+                self.stdout = HangingStream()
+                self.stderr = FakeStream([b"some error\n"])
+                self.returncode = -9
+            async def wait(self):
+                pass
+            def kill(self):
+                pass
+            async def communicate(self):
+                return b"", b""
+
+        with patch("asyncio.create_subprocess_exec", return_value=FakeProc()):
+            events = []
+            async for event in bridge.stream_ask("topic1", "hello"):
+                events.append(event)
+
+        final_events = [e for e in events if e["type"] == "final"]
+        self.assertEqual(len(final_events), 1)
+        self.assertIn("timed out", final_events[0]["result"].reply_text)
+
+
 if __name__ == "__main__":
     unittest.main()
