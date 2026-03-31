@@ -36,6 +36,9 @@ import yaml
 
 log = logging.getLogger("gateway")
 
+# Max auto-retries when CLI exits with stop_reason=tool_use and empty result
+_MAX_TOOL_USE_RETRIES = 2
+
 
 # ===========================================================================
 # Config
@@ -197,7 +200,57 @@ class ClaudeCodeBridge:
         return result or StreamResult()
 
     async def stream_ask(self, topic_id: str, prompt: str) -> AsyncIterator[dict[str, Any]]:
-        """Stream Claude Code output as immediate events plus one final result."""
+        """Stream Claude Code output with auto-retry on tool_use exit.
+
+        When the CLI exits with stop_reason=tool_use and empty result, it means
+        the model requested a tool but the CLI stopped before executing it.
+        This wrapper auto-retries by resuming the session, giving the model
+        a continuation prompt so it can proceed.
+        """
+        for attempt in range(_MAX_TOOL_USE_RETRIES + 1):
+            final_result: StreamResult | None = None
+            async for event in self._stream_ask_once(topic_id, prompt):
+                if event["type"] == "final":
+                    final_result = event["result"]
+                else:
+                    yield event
+
+            if final_result is None:
+                return
+
+            # Check if we should retry: stop_reason=tool_use with empty result
+            should_retry = (
+                final_result.stop_reason == "tool_use"
+                and not final_result.result_text
+                and not final_result.assistant_texts
+                and final_result.session_id
+                and attempt < _MAX_TOOL_USE_RETRIES
+            )
+
+            if should_retry:
+                log.warning(
+                    "[Bridge] AUTO-RETRY %d/%d: stop_reason=tool_use with empty result, "
+                    "resuming session %s",
+                    attempt + 1, _MAX_TOOL_USE_RETRIES, final_result.session_id,
+                )
+                # Use "continue" as the prompt to let the model proceed
+                prompt = "continue"
+                continue
+
+            # No retry needed — yield the final result
+            yield {"type": "final", "result": final_result}
+            return
+
+        # Exhausted retries — yield whatever we have
+        log.error(
+            "[Bridge] exhausted %d tool_use retries — returning last result",
+            _MAX_TOOL_USE_RETRIES,
+        )
+        if final_result is not None:
+            yield {"type": "final", "result": final_result}
+
+    async def _stream_ask_once(self, topic_id: str, prompt: str) -> AsyncIterator[dict[str, Any]]:
+        """Single attempt: stream Claude Code output as events plus one final result."""
         session_id = self._sessions.get(topic_id)
         full_prompt = f"{self.instruction}\n\n{prompt}" if self.instruction else prompt
         cmd = self._build_cmd(full_prompt, session_id)
@@ -296,8 +349,11 @@ class ClaudeCodeBridge:
         # DIAG: dump raw tail when result is empty — this is the key diagnostic
         if state.result.is_empty:
             log.warning(
-                "[Bridge] EMPTY RESULT diagnostic — assistant_texts=%d tool_calls=%d result_text_len=%d",
-                len(state.result.assistant_texts), len(state.result.tool_calls), len(state.result.result_text),
+                "[Bridge] EMPTY RESULT diagnostic — assistant_texts=%d tool_calls=%d "
+                "result_text_len=%d thinking=%d stop_reason=%s",
+                len(state.result.assistant_texts), len(state.result.tool_calls),
+                len(state.result.result_text), len(state.result.thinking),
+                state.result.stop_reason,
             )
             log.warning("[Bridge] EMPTY RESULT — dumping last %d raw output lines:", len(raw_tail))
             for i, rl in enumerate(raw_tail):
@@ -489,6 +545,14 @@ class ClaudeCodeBridge:
         if event_type == "assistant":
             message = event.get("message", {})
             content = message.get("content", [])
+            # DIAG: event-level summary — block count and all types at a glance
+            block_types_summary = []
+            for b in content:
+                if isinstance(b, dict):
+                    block_types_summary.append(b.get("type", f"NO_TYPE(keys={list(b.keys())[:4]})"))
+                else:
+                    block_types_summary.append(f"non-dict({type(b).__name__})")
+            log.info("[Bridge] assistant event: %d content blocks, types=%s", len(content), block_types_summary)
             for block in content:
                 if not isinstance(block, dict):
                     continue
@@ -545,6 +609,10 @@ class ClaudeCodeBridge:
                 elif block_type == "redacted_thinking":
                     # Extended thinking encrypted block — safe to skip silently
                     log.debug("[Bridge] redacted_thinking block (encrypted extended thinking) — skipped")
+
+                elif block_type is None and "signature" in block:
+                    # Encrypted extended thinking block — no type field, just {"signature":"enc_..."}
+                    log.debug("[Bridge] encrypted thinking block (signature-only format) — skipped")
 
                 else:
                     log.warning("[Bridge] UNKNOWN block type=%r in assistant event — keys=%s preview=%s",

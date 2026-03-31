@@ -1054,7 +1054,7 @@ class TestStderrSeparation(unittest.IsolatedAsyncioTestCase):
 
         stdout_lines = [
             json.dumps({"type": "system", "subtype": "init", "session_id": "s1"}).encode() + b"\n",
-            json.dumps({"type": "result", "result": "", "session_id": "s1", "stop_reason": "tool_use", "num_turns": 3}).encode() + b"\n",
+            json.dumps({"type": "result", "result": "", "session_id": "s1", "stop_reason": "end_turn", "num_turns": 3}).encode() + b"\n",
         ]
         stderr_lines_raw = [
             b"FATAL: max context length exceeded\n",
@@ -1299,3 +1299,412 @@ class TestStopReasonCapture(unittest.TestCase):
         ClaudeCodeBridge._consume_event(state, event)
         self.assertEqual(state.result.stop_reason, "end_turn")
         self.assertEqual(state.result.result_text, "Done.")
+
+# =========================================================================
+# Encrypted thinking blocks & tool_use retry
+# =========================================================================
+
+class TestEncryptedThinkingBlocks(unittest.TestCase):
+    """Encrypted/signature-only thinking blocks must not break parsing."""
+
+    def test_signature_only_block_skipped(self):
+        """Content block with only 'signature' (no type) should be skipped silently."""
+        state = StreamState()
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"signature": "enc_gAAAAA_very_long_encrypted_blob"},
+                    {"type": "text", "text": "Here is the answer."},
+                ]
+            },
+        }
+        emitted = ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(len(state.result.assistant_texts), 1)
+        self.assertEqual(state.result.assistant_texts[0], "Here is the answer.")
+        # Should emit only the text event, not the signature block
+        stream_events = [e for e in emitted if e["type"] == "stream_event"]
+        self.assertEqual(len(stream_events), 1)
+        self.assertEqual(stream_events[0]["event"].kind, "text")
+
+    def test_signature_block_before_tool_use(self):
+        """Signature block followed by tool_use block — tool_use must still be captured."""
+        state = StreamState()
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"signature": "enc_gAAAAA_encrypted_thinking"},
+                    {"type": "tool_use", "id": "toolu_abc", "name": "Read", "input": {"file_path": "/src/main.py"}},
+                ]
+            },
+        }
+        emitted = ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(len(state.result.tool_calls), 1)
+        self.assertEqual(state.result.tool_calls[0].name, "Read")
+        self.assertEqual(state.result.tool_calls[0].input_text, "/src/main.py")
+
+    def test_only_signature_block_no_crash(self):
+        """Content with only a signature block should not crash and yield nothing."""
+        state = StreamState()
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"signature": "enc_gAAAAA_some_encrypted_data"},
+                ]
+            },
+        }
+        emitted = ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(len(state.result.assistant_texts), 0)
+        self.assertEqual(len(state.result.tool_calls), 0)
+        self.assertEqual(len(emitted), 0)
+
+    def test_redacted_thinking_with_type_field(self):
+        """Standard redacted_thinking block (with type field) should be skipped."""
+        state = StreamState()
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "redacted_thinking", "data": "encrypted_blob"},
+                    {"type": "text", "text": "Response text."},
+                ]
+            },
+        }
+        emitted = ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(len(state.result.assistant_texts), 1)
+        self.assertEqual(state.result.assistant_texts[0], "Response text.")
+
+    def test_mixed_thinking_signature_tool_use(self):
+        """Real-world pattern: thinking + signature + tool_use in one event."""
+        state = StreamState()
+        events = [
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "thinking", "thinking": "Let me analyze this."},
+                    ]
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"signature": "enc_gAAAAA_redacted"},
+                        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls -la"}},
+                    ]
+                },
+            },
+        ]
+        for e in events:
+            ClaudeCodeBridge._consume_event(state, e)
+        self.assertEqual(len(state.result.thinking), 1)
+        self.assertEqual(len(state.result.tool_calls), 1)
+        self.assertEqual(state.result.tool_calls[0].name, "Bash")
+
+
+class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
+    """Auto-retry when CLI exits with stop_reason=tool_use and empty result."""
+
+    def _make_bridge(self):
+        cfg = {
+            "ttadk_cmd": "echo",
+            "model": "gpt-5.4",
+            "target": "claude",
+            "timeout": 10,
+        }
+        return ClaudeCodeBridge(cfg)
+
+    async def test_retry_on_tool_use_empty_result(self):
+        """stream_ask retries when stop_reason=tool_use with empty result."""
+        bridge = self._make_bridge()
+        call_count = 0
+
+        async def fake_once(topic_id, prompt):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First attempt: tool_use exit with empty result
+                yield {
+                    "type": "stream_event",
+                    "event": StreamEvent(kind="thinking", text="Analyzing..."),
+                }
+                yield {
+                    "type": "final",
+                    "result": StreamResult(
+                        stop_reason="tool_use",
+                        session_id="sess_abc",
+                    ),
+                }
+            else:
+                # Retry: successful response
+                yield {
+                    "type": "stream_event",
+                    "event": StreamEvent(kind="text", text="Here is the answer."),
+                }
+                yield {
+                    "type": "final",
+                    "result": StreamResult(
+                        result_text="Here is the answer.",
+                        stop_reason="end_turn",
+                        session_id="sess_abc",
+                    ),
+                }
+
+        bridge._stream_ask_once = fake_once
+
+        events = []
+        async for event in bridge.stream_ask("topic1", "hello"):
+            events.append(event)
+
+        self.assertEqual(call_count, 2)
+        # Final event should have the successful result
+        final = [e for e in events if e["type"] == "final"]
+        self.assertEqual(len(final), 1)
+        self.assertEqual(final[0]["result"].result_text, "Here is the answer.")
+        self.assertEqual(final[0]["result"].stop_reason, "end_turn")
+
+    async def test_no_retry_on_normal_result(self):
+        """stream_ask does NOT retry when result is normal."""
+        bridge = self._make_bridge()
+        call_count = 0
+
+        async def fake_once(topic_id, prompt):
+            nonlocal call_count
+            call_count += 1
+            yield {
+                "type": "final",
+                "result": StreamResult(
+                    result_text="Normal response.",
+                    stop_reason="end_turn",
+                    session_id="sess_abc",
+                ),
+            }
+
+        bridge._stream_ask_once = fake_once
+
+        events = []
+        async for event in bridge.stream_ask("topic1", "hello"):
+            events.append(event)
+
+        self.assertEqual(call_count, 1)
+
+    async def test_no_retry_when_assistant_texts_present(self):
+        """Even with stop_reason=tool_use, don't retry if we have assistant_texts."""
+        bridge = self._make_bridge()
+        call_count = 0
+
+        async def fake_once(topic_id, prompt):
+            nonlocal call_count
+            call_count += 1
+            yield {
+                "type": "final",
+                "result": StreamResult(
+                    assistant_texts=["I found the following..."],
+                    stop_reason="tool_use",
+                    session_id="sess_abc",
+                ),
+            }
+
+        bridge._stream_ask_once = fake_once
+
+        events = []
+        async for event in bridge.stream_ask("topic1", "hello"):
+            events.append(event)
+
+        # Should NOT retry because we have assistant_texts
+        self.assertEqual(call_count, 1)
+
+    async def test_retry_exhaustion(self):
+        """After max retries, return the last result even if still tool_use."""
+        bridge = self._make_bridge()
+        call_count = 0
+
+        async def fake_once(topic_id, prompt):
+            nonlocal call_count
+            call_count += 1
+            yield {
+                "type": "final",
+                "result": StreamResult(
+                    stop_reason="tool_use",
+                    session_id="sess_abc",
+                ),
+            }
+
+        bridge._stream_ask_once = fake_once
+
+        events = []
+        async for event in bridge.stream_ask("topic1", "hello"):
+            events.append(event)
+
+        # Should try 1 + 2 retries = 3 total
+        self.assertEqual(call_count, 3)
+        final = [e for e in events if e["type"] == "final"]
+        self.assertEqual(len(final), 1)
+        self.assertEqual(final[0]["result"].stop_reason, "tool_use")
+
+    async def test_no_retry_without_session_id(self):
+        """Cannot retry without session_id (needed for --resume)."""
+        bridge = self._make_bridge()
+        call_count = 0
+
+        async def fake_once(topic_id, prompt):
+            nonlocal call_count
+            call_count += 1
+            yield {
+                "type": "final",
+                "result": StreamResult(
+                    stop_reason="tool_use",
+                    session_id=None,  # no session
+                ),
+            }
+
+        bridge._stream_ask_once = fake_once
+
+        events = []
+        async for event in bridge.stream_ask("topic1", "hello"):
+            events.append(event)
+
+        # Should NOT retry without session_id
+        self.assertEqual(call_count, 1)
+
+    async def test_retry_uses_continue_prompt(self):
+        """Retry should use 'continue' as the prompt."""
+        bridge = self._make_bridge()
+        prompts_received = []
+
+        async def fake_once(topic_id, prompt):
+            prompts_received.append(prompt)
+            if len(prompts_received) == 1:
+                yield {
+                    "type": "final",
+                    "result": StreamResult(
+                        stop_reason="tool_use",
+                        session_id="sess_abc",
+                    ),
+                }
+            else:
+                yield {
+                    "type": "final",
+                    "result": StreamResult(
+                        result_text="Done.",
+                        stop_reason="end_turn",
+                        session_id="sess_abc",
+                    ),
+                }
+
+        bridge._stream_ask_once = fake_once
+
+        async for _ in bridge.stream_ask("topic1", "original question"):
+            pass
+
+        self.assertEqual(prompts_received[0], "original question")
+        self.assertEqual(prompts_received[1], "continue")
+
+    async def test_stream_events_forwarded_during_retry(self):
+        """Stream events from all attempts should be forwarded to caller."""
+        bridge = self._make_bridge()
+        call_count = 0
+
+        async def fake_once(topic_id, prompt):
+            nonlocal call_count
+            call_count += 1
+            yield {
+                "type": "stream_event",
+                "event": StreamEvent(kind="thinking", text=f"Attempt {call_count}"),
+            }
+            if call_count == 1:
+                yield {
+                    "type": "final",
+                    "result": StreamResult(
+                        stop_reason="tool_use",
+                        session_id="sess_abc",
+                    ),
+                }
+            else:
+                yield {
+                    "type": "final",
+                    "result": StreamResult(
+                        result_text="Success",
+                        stop_reason="end_turn",
+                        session_id="sess_abc",
+                    ),
+                }
+
+        bridge._stream_ask_once = fake_once
+
+        events = []
+        async for event in bridge.stream_ask("topic1", "hello"):
+            events.append(event)
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        self.assertEqual(len(stream_events), 2)
+        self.assertEqual(stream_events[0]["event"].text, "Attempt 1")
+        self.assertEqual(stream_events[1]["event"].text, "Attempt 2")
+
+
+class TestAssistantEventDiagnostics(unittest.TestCase):
+    """Event-level diagnostic logging for assistant events."""
+
+    def test_empty_content_array(self):
+        """Assistant event with empty content should not crash."""
+        state = StreamState()
+        event = {"type": "assistant", "message": {"content": []}}
+        emitted = ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(len(emitted), 0)
+        self.assertEqual(len(state.result.assistant_texts), 0)
+
+    def test_content_with_non_dict_items(self):
+        """Non-dict items in content array should be skipped."""
+        state = StreamState()
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    "some string",
+                    42,
+                    {"type": "text", "text": "Valid text."},
+                ]
+            },
+        }
+        emitted = ClaudeCodeBridge._consume_event(state, event)
+        self.assertEqual(len(state.result.assistant_texts), 1)
+        self.assertEqual(state.result.assistant_texts[0], "Valid text.")
+
+    def test_parse_stream_with_encrypted_blocks(self):
+        """Full stream parse with encrypted thinking blocks."""
+        stream = "\n".join([
+            json.dumps({"type": "system", "subtype": "init", "session_id": "sess_1"}),
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "thinking", "thinking": "Let me check."},
+                    ]
+                },
+            }),
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"signature": "enc_gAAAAA_long_encrypted_blob"},
+                    ]
+                },
+            }),
+            json.dumps({
+                "type": "result",
+                "result": "",
+                "stop_reason": "tool_use",
+                "num_turns": 1,
+                "session_id": "sess_1",
+            }),
+        ])
+        result = ClaudeCodeBridge._parse_stream(stream)
+        self.assertEqual(result.stop_reason, "tool_use")
+        self.assertEqual(len(result.thinking), 1)
+        self.assertEqual(result.thinking[0], "Let me check.")
+        self.assertEqual(result.result_text, "")
+        self.assertEqual(len(result.tool_calls), 0)
+        self.assertEqual(len(result.assistant_texts), 0)
