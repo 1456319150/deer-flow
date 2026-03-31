@@ -146,7 +146,7 @@ class FeishuBot:
         result = StreamResult()
         emitted_event_keys: set[tuple[str, str]] = set()
         streamed_texts: list[str] = []
-        tool_cards: dict[str, dict[str, str]] = {}
+        tool_cards: dict[str, dict[str, str | None]] = {}
         saw_stream_event = False
 
         try:
@@ -169,15 +169,24 @@ class FeishuBot:
                             continue
                     if stream_event.kind == "tool_result" and stream_event.tool_use_id in tool_cards:
                         tool_card = tool_cards[stream_event.tool_use_id]
-                        merged = self._merge_tool_stream_blocks(tool_card["tool_use_block"], stream_event)
-                        if merged and merged != tool_card.get("content"):
+                        merged = self._merge_tool_stream_blocks(str(tool_card["tool_use_block"]), stream_event)
+                        if not merged or merged == tool_card.get("content"):
+                            continue
+                        if tool_card.get("card_id"):
                             log.info(
                                 "[RenderCard] mode=update content_len=%d tool_use_id=%s",
                                 len(merged),
                                 stream_event.tool_use_id,
                             )
-                            await self._update_card(tool_card["card_id"], merged)
-                            tool_card["content"] = merged
+                            await self._update_card(str(tool_card["card_id"]), merged)
+                        else:
+                            log.info(
+                                "[RenderCard] mode=reply reason=missing_card_id_fallback tool=%s tool_use_id=%s",
+                                stream_event.tool_name or "-",
+                                stream_event.tool_use_id,
+                            )
+                            await self._reply_card(msg_id, merged)
+                        tool_card["content"] = merged
                         continue
                     if stream_event.kind == "tool_result" and stream_event.tool_use_id:
                         log.info(
@@ -205,12 +214,12 @@ class FeishuBot:
                     )
                     card_id = await self._reply_card(msg_id, block)
                     if stream_event.kind == "tool_use" and stream_event.tool_use_id:
+                        tool_cards[stream_event.tool_use_id] = {
+                            "card_id": card_id,
+                            "tool_use_block": block,
+                            "content": block,
+                        }
                         if card_id:
-                            tool_cards[stream_event.tool_use_id] = {
-                                "card_id": card_id,
-                                "tool_use_block": block,
-                                "content": block,
-                            }
                             log.info(
                                 "[RenderCard] mode=bind tool=%s tool_use_id=%s card_id=%s",
                                 stream_event.tool_name or "-",

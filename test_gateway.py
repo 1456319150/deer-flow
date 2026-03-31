@@ -711,6 +711,33 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         self.assertIn("first", bot._update_card.await_args_list[0].args[1])
         self.assertIn("second", bot._update_card.await_args_list[1].args[1])
 
+    async def test_handle_missing_card_id_falls_back_to_merged_reply(self):
+        bridge = ClaudeCodeBridge({})
+        bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
+
+        async def fake_stream_ask(topic_id, prompt):
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Bash", tool_use_id="t1", text="git status")}
+            yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Bash", tool_use_id="t1", text="working tree clean")}
+            yield {"type": "final", "result": StreamResult(tool_calls=[
+                ToolCall(name="Bash", input_text="git status", output_text="working tree clean"),
+            ])}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        bot._reply_card = AsyncMock(side_effect=[None, "fallback-card"])
+        bot._update_card = AsyncMock()
+        bot._react = AsyncMock()
+
+        await bot._handle("chat", "msg", "topic", "hello")
+
+        self.assertEqual(bot._reply_card.await_count, 2)
+        first_card = bot._reply_card.await_args_list[0].args[1]
+        second_card = bot._reply_card.await_args_list[1].args[1]
+        self.assertIn("🔧 Tool Use: Bash", first_card)
+        self.assertIn("🔧 Tool Use: Bash", second_card)
+        self.assertIn("📦 Tool Result: Bash", second_card)
+        self.assertIn("working tree clean", second_card)
+        bot._update_card.assert_not_awaited()
+
     async def test_handle_without_stream_text_appends_final_reply(self):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
