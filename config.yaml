@@ -11,7 +11,7 @@ claude:
   target: claude
   timeout: 600               # seconds
   session_store_path: .gateway-sessions.json
-  allowed_tools: "Bash,Read,Write,Edit,Glob,WebSearch,WebFetch"
+  # allowed_tools: "Bash,Read,Write,Edit,Glob,WebSearch,WebFetch"
   # instruction: "Always respond in Chinese."  # Optional: prepended to user prompt
 
 # --- WeChat Channel (iLink protocol) ---

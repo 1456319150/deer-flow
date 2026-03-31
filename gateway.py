@@ -648,6 +648,7 @@ class ClaudeCodeBridge:
         safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
         parts = [
             f"-p {safe(prompt)}",
+            "--dangerously-skip-permissions",
             "--output-format stream-json",
             "--verbose",
         ]
