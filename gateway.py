@@ -206,6 +206,12 @@ class ClaudeCodeBridge:
         state = StreamState()
         output_len = 0
 
+        # DIAG: line counters + raw tail buffer for empty-result diagnostics
+        json_line_count = 0
+        non_json_line_count = 0
+        event_types_seen: list[str] = []
+        raw_tail: list[str] = []  # last 20 lines (truncated to 300 chars each)
+
         try:
             async with asyncio.timeout(self.timeout):
                 assert proc.stdout is not None
@@ -215,6 +221,24 @@ class ClaudeCodeBridge:
                         break
                     decoded = line.decode("utf-8", errors="replace")
                     output_len += len(decoded)
+
+                    # DIAG: classify and buffer raw lines
+                    stripped = decoded.strip()
+                    if stripped.startswith("{"):
+                        json_line_count += 1
+                        # DIAG: track event type for summary
+                        try:
+                            peek = json.loads(stripped)
+                            etype = peek.get("type", "?")
+                            event_types_seen.append(etype)
+                        except json.JSONDecodeError:
+                            event_types_seen.append("json_err")
+                    else:
+                        non_json_line_count += 1
+                    raw_tail.append(stripped[:300])
+                    if len(raw_tail) > 20:
+                        raw_tail.pop(0)
+
                     for event in self._consume_stream_line(state, decoded):
                         if event["type"] == "session" and event["session_id"]:
                             await self._remember_session(topic_id, event["session_id"])
@@ -228,7 +252,21 @@ class ClaudeCodeBridge:
             yield {"type": "final", "result": r}
             return
 
-        log.info("[Bridge] exit=%d output=%d chars", proc.returncode, output_len)
+        # DIAG: enhanced exit log with line counters and event type summary
+        log.info(
+            "[Bridge] exit=%d output=%d chars json_lines=%d non_json_lines=%d event_types=%s",
+            proc.returncode, output_len, json_line_count, non_json_line_count, event_types_seen,
+        )
+
+        # DIAG: dump raw tail when result is empty — this is the key diagnostic
+        if state.result.is_empty:
+            log.warning(
+                "[Bridge] EMPTY RESULT diagnostic — assistant_texts=%d tool_calls=%d result_text_len=%d",
+                len(state.result.assistant_texts), len(state.result.tool_calls), len(state.result.result_text),
+            )
+            log.warning("[Bridge] EMPTY RESULT — dumping last %d raw output lines:", len(raw_tail))
+            for i, rl in enumerate(raw_tail):
+                log.warning("[Bridge] raw_tail[%02d]: %s", i, rl)
 
         if state.result.session_id:
             await self._remember_session(topic_id, state.result.session_id)
@@ -497,12 +535,29 @@ class ClaudeCodeBridge:
                     result.usage.total_tokens,
                     result.usage.cost_usd,
                 )
+
+            # DIAG: dump full result event when result text is empty
+            if not result.result_text:
+                log.warning(
+                    "[BridgeResult] EMPTY result text — full event JSON: %s",
+                    json.dumps(event, ensure_ascii=False, default=str)[:3000],
+                )
+
             if result.result_text:
                 cls._emit_stream_event(emitted, "result", text=result.result_text)
             session_id = event.get("session_id")
             if session_id:
                 result.session_id = session_id
                 emitted.append({"type": "session", "session_id": session_id})
+
+        # DIAG: log any event type not handled above
+        elif event_type is not None:
+            log.warning(
+                "[BridgeEvent] UNRECOGNIZED event type=%r keys=%s preview=%s",
+                event_type,
+                list(event.keys())[:15],
+                json.dumps(event, ensure_ascii=False, default=str)[:500],
+            )
 
         return emitted
 
