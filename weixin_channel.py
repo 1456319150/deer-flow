@@ -165,7 +165,7 @@ async def qr_login(baseurl: str = ILINK_DEFAULT_BASE) -> WeixinAccount:
             f"{baseurl}/ilink/bot/get_bot_qrcode?bot_type=3",
             headers=_headers(),
         ) as resp:
-            data = await resp.json()
+            data = await resp.json(content_type=None)
 
         qr_url = data.get("qrcode_img_content", "")
         qr_key = data.get("qrcode", "")
