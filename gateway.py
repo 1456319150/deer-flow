@@ -252,7 +252,7 @@ class ClaudeCodeBridge:
                         non_json_line_count += 1
                         if stripped:
                             log.debug(f"[Bridge] non-JSON stdout line: {stripped!r}")
-                    raw_tail.append(stripped[:300])
+                    raw_tail.append(stripped[:2000])
                     if len(raw_tail) > 20:
                         raw_tail.pop(0)
 
@@ -480,6 +480,12 @@ class ClaudeCodeBridge:
                     continue
                 block_type = block.get("type")
 
+                # DIAG: log each content block for tool-use debugging
+                log.info("[Bridge] content block: type=%s keys=%s", block_type, list(block.keys())[:8])
+                if block_type == "tool_use":
+                    log.info("[Bridge] tool_use requested: name=%s id=%s", block.get("name"), block.get("id"))
+
+
                 if block_type == "text":
                     text = block.get("text", "").strip()
                     if text:
@@ -521,6 +527,11 @@ class ClaudeCodeBridge:
                         state.pending_tools[tool_use_id].output_text = output
                         tool_name = state.pending_tools[tool_use_id].name
                     cls._emit_stream_event(emitted, "tool_result", text=output, tool_name=tool_name, tool_use_id=tool_use_id)
+
+                else:
+                    log.warning("[Bridge] UNKNOWN block type=%r in assistant event — keys=%s preview=%s",
+                                block_type, list(block.keys())[:10],
+                                json.dumps(block, ensure_ascii=False, default=str)[:500])
 
         elif event_type == "user":
             message = event.get("message", {})
