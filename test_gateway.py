@@ -508,6 +508,19 @@ class TestBuildCmd(unittest.TestCase):
         args_str = " ".join(cmd)
         self.assertIn("'\"'\"'", args_str)
 
+    def test_provider_defaults_to_claude(self):
+        self.assertEqual(self.bridge.provider, "claude")
+
+    def test_provider_infers_codex_from_target(self):
+        bridge = ClaudeCodeBridge({"model": "gpt-5.4", "target": "codex"})
+        self.assertEqual(bridge.provider, "codex")
+        cmd = bridge._build_cmd("hello", None)
+        self.assertEqual(cmd[cmd.index("-t") + 1], "codex")
+
+    def test_provider_override_wins(self):
+        bridge = ClaudeCodeBridge({"model": "gpt-5.4", "target": "claude", "provider": "codex"})
+        self.assertEqual(bridge.provider, "codex")
+
 
 class TestStreamingHelpers(unittest.TestCase):
 
@@ -561,6 +574,17 @@ class TestStreamingHelpers(unittest.TestCase):
         self.assertIsNotNone(state.result.usage)
         self.assertEqual(state.result.usage.total_tokens, 12)
         self.assertAlmostEqual(state.result.usage.cost_usd, 0.0012)
+
+    def test_consume_stream_line_supports_provider_dispatch(self):
+        state = StreamState()
+        events = ClaudeCodeBridge._consume_stream_line(
+            state,
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello"}]}}),
+            provider="codex",
+        )
+        self.assertEqual([event["type"] for event in events], ["stream_event"])
+        self.assertEqual(events[0]["event"].kind, "text")
+        self.assertEqual(state.result.assistant_texts, ["Hello"])
 
 
 # ===========================================================================

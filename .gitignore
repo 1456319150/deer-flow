@@ -6,9 +6,11 @@ venv/
 .venv/
 .python-version
 logs/
+log/
 .vscode/
 .gateway-sessions.json
 .claude/
+skills-lock.json
 
 # WeChat channel state
 .weixin-account.json

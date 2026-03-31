@@ -184,12 +184,25 @@ class ClaudeCodeBridge:
         self.ttadk_cmd: str = cfg.get("ttadk_cmd", "ttadk")
         self.model: str = cfg.get("model", "gpt-5.4")
         self.target: str = cfg.get("target", "claude")
+        self.provider: str = self._resolve_provider(cfg.get("provider"), self.target)
         self.timeout: int = cfg.get("timeout", 600)
         self.allowed_tools: str = cfg.get("allowed_tools", "")
         self.instruction: str = cfg.get("instruction", "")
         self.session_store_path: str = cfg.get("session_store_path", ".gateway-sessions.json")
         self._session_lock = asyncio.Lock()
         self._sessions: dict[str, str] = self._load_sessions()
+
+    @staticmethod
+    def _resolve_provider(provider: Any, target: str) -> str:
+        if isinstance(provider, str) and provider.strip():
+            return provider.strip().lower()
+        return "codex" if str(target).strip().lower() == "codex" else "claude"
+
+    def _build_full_prompt(self, prompt: str) -> str:
+        return f"{self.instruction}\n\n{prompt}" if self.instruction else prompt
+
+    def _retry_prompt(self, _result: StreamResult) -> str:
+        return "continue"
 
     async def ask(self, topic_id: str, prompt: str) -> StreamResult:
         """Send prompt to Claude Code, return structured StreamResult."""
@@ -233,8 +246,7 @@ class ClaudeCodeBridge:
                     "resuming session %s",
                     attempt + 1, _MAX_TOOL_USE_RETRIES, final_result.session_id,
                 )
-                # Use "continue" as the prompt to let the model proceed
-                prompt = "continue"
+                prompt = self._retry_prompt(final_result)
                 continue
 
             # No retry needed — yield the final result
@@ -252,7 +264,7 @@ class ClaudeCodeBridge:
     async def _stream_ask_once(self, topic_id: str, prompt: str) -> AsyncIterator[dict[str, Any]]:
         """Single attempt: stream Claude Code output as events plus one final result."""
         session_id = self._sessions.get(topic_id)
-        full_prompt = f"{self.instruction}\n\n{prompt}" if self.instruction else prompt
+        full_prompt = self._build_full_prompt(prompt)
         cmd = self._build_cmd(full_prompt, session_id)
 
         log.info("[Bridge] topic=%s session=%s prompt=%d chars", topic_id, session_id, len(prompt))
@@ -323,7 +335,7 @@ class ClaudeCodeBridge:
                     if len(raw_tail) > 20:
                         raw_tail.pop(0)
 
-                    for event in self._consume_stream_line(state, decoded):
+                    for event in self._consume_stream_line(state, decoded, provider=self.provider):
                         if event["type"] == "session" and event["session_id"]:
                             await self._remember_session(topic_id, event["session_id"])
                         else:
@@ -372,17 +384,52 @@ class ClaudeCodeBridge:
     def _event_to_lines(event: dict) -> list[str]:
         return [json.dumps(event, ensure_ascii=False)]
 
-    @classmethod
-    def _consume_stream_line(cls, state: StreamState, line: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _parse_json_event(line: str) -> dict[str, Any] | None:
         stripped = line.strip()
         if not stripped.startswith("{"):
-            return []
+            return None
         try:
-            event = json.loads(stripped)
+            return json.loads(stripped)
         except json.JSONDecodeError:
             log.debug(f"[Bridge] non-JSON line in stream: {stripped!r}")
+            return None
+
+    @classmethod
+    def _consume_stream_line(
+        cls,
+        state: StreamState,
+        line: str,
+        provider: str = "claude",
+    ) -> list[dict[str, Any]]:
+        if provider == "codex":
+            return cls._consume_stream_line_codex(state, line)
+        return cls._consume_stream_line_claude(state, line)
+
+    @classmethod
+    def _consume_stream_line_claude(cls, state: StreamState, line: str) -> list[dict[str, Any]]:
+        event = cls._parse_json_event(line)
+        if event is None:
             return []
-        return cls._consume_event(state, event)
+        return cls._consume_event_claude(state, event)
+
+    @classmethod
+    def _consume_stream_line_codex(cls, state: StreamState, line: str) -> list[dict[str, Any]]:
+        event = cls._parse_json_event(line)
+        if event is None:
+            return []
+        return cls._consume_event_codex(state, event)
+
+    @classmethod
+    def _consume_event(
+        cls,
+        state: StreamState,
+        event: dict[str, Any],
+        provider: str = "claude",
+    ) -> list[dict[str, Any]]:
+        if provider == "codex":
+            return cls._consume_event_codex(state, event)
+        return cls._consume_event_claude(state, event)
 
     @classmethod
     def _emit_stream_event(
@@ -537,7 +584,7 @@ class ClaudeCodeBridge:
         return summary if summary.has_values else None
 
     @classmethod
-    def _consume_event(cls, state: StreamState, event: dict[str, Any]) -> list[dict[str, Any]]:
+    def _consume_event_claude(cls, state: StreamState, event: dict[str, Any]) -> list[dict[str, Any]]:
         emitted: list[dict[str, Any]] = []
         result = state.result
         event_type = event.get("type")
@@ -692,12 +739,16 @@ class ClaudeCodeBridge:
 
         return emitted
 
+    @classmethod
+    def _consume_event_codex(cls, state: StreamState, event: dict[str, Any]) -> list[dict[str, Any]]:
+        return cls._consume_event_claude(state, event)
+
     @staticmethod
-    def _parse_stream(raw: str) -> StreamResult:
+    def _parse_stream(raw: str, provider: str = "claude") -> StreamResult:
         """Parse stream-json output from Claude Code CLI."""
         state = StreamState()
         for line in raw.splitlines():
-            ClaudeCodeBridge._consume_stream_line(state, line)
+            ClaudeCodeBridge._consume_stream_line(state, line, provider=provider)
         return state.result
 
     def _load_sessions(self) -> dict[str, str]:
@@ -731,7 +782,11 @@ class ClaudeCodeBridge:
         os.replace(tmp_path, self.session_store_path)
 
     def _build_cmd(self, prompt: str, session_id: str | None) -> list[str]:
-        """Build ttadk CLI command list."""
+        if self.provider == "codex":
+            return self._build_cmd_codex(prompt, session_id)
+        return self._build_cmd_claude(prompt, session_id)
+
+    def _build_cmd_claude(self, prompt: str, session_id: str | None) -> list[str]:
         safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
         parts = [
             f"-p {safe(prompt)}",
@@ -744,6 +799,9 @@ class ClaudeCodeBridge:
         if self.allowed_tools:
             parts.append(f"--allowedTools {self.allowed_tools}")
         return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
+
+    def _build_cmd_codex(self, prompt: str, session_id: str | None) -> list[str]:
+        return self._build_cmd_claude(prompt, session_id)
 
 
 # ===========================================================================
