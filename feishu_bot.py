@@ -154,10 +154,14 @@ class FeishuBot:
         _thinking_acc: list[str] = []
         _result_card_id: str | None = None
         _result_acc: list[str] = []
-        _STREAM_THROTTLE = 0.3  # min seconds between card updates
+        _STREAM_THROTTLE = 0.5  # min seconds between card updates
         import time as _time
         _last_thinking_update = 0.0
         _last_result_update = 0.0
+
+        # Fire-and-forget update tasks — avoid blocking the SSE loop
+        _thinking_update_task: asyncio.Task | None = None
+        _result_update_task: asyncio.Task | None = None
 
         try:
             async for event in self.bridge.stream_ask(topic_id, text):
@@ -179,12 +183,14 @@ class FeishuBot:
                             full = "".join(_thinking_acc)
                             block = "💭 **Thinking...**\n\n" + full
                             if _thinking_card_id:
-                                try:
-                                    await self._update_card(_thinking_card_id, block)
-                                except Exception:
-                                    log.debug("update thinking card failed, creating new")
-                                    _thinking_card_id = await self._reply_card(msg_id, block)
+                                # Cancel previous pending update if still running
+                                if _thinking_update_task and not _thinking_update_task.done():
+                                    _thinking_update_task.cancel()
+                                _thinking_update_task = asyncio.create_task(
+                                    self._update_card(_thinking_card_id, block)
+                                )
                             else:
+                                # Must await creation to get card_id
                                 _thinking_card_id = await self._reply_card(msg_id, block)
                             _last_thinking_update = now
                         continue
@@ -195,12 +201,14 @@ class FeishuBot:
                         if now - _last_result_update >= _STREAM_THROTTLE:
                             full = "".join(_result_acc)
                             if _result_card_id:
-                                try:
-                                    await self._update_card(_result_card_id, full)
-                                except Exception:
-                                    log.debug("update result card failed, creating new")
-                                    _result_card_id = await self._reply_card(msg_id, full)
+                                # Cancel previous pending update if still running
+                                if _result_update_task and not _result_update_task.done():
+                                    _result_update_task.cancel()
+                                _result_update_task = asyncio.create_task(
+                                    self._update_card(_result_card_id, full)
+                                )
                             else:
+                                # Must await creation to get card_id
                                 _result_card_id = await self._reply_card(msg_id, full)
                             _last_result_update = now
                         continue
@@ -281,6 +289,14 @@ class FeishuBot:
         except Exception as e:
             log.exception("Bridge error")
             result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
+
+        # ── Wait for pending update tasks before final flush ───
+        for task in (_thinking_update_task, _result_update_task):
+            if task and not task.done():
+                try:
+                    await task
+                except Exception:
+                    pass
 
         # ── Final flush for streaming cards ────────────────────
         if _thinking_acc:
