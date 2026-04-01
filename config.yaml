@@ -1,6 +1,9 @@
 # Feishu → Claude Code Gateway
 # Env vars: FEISHU_APP_ID, FEISHU_APP_SECRET
 
+# Provider selection: "claude" (default) or "mira"
+provider: claude
+
 feishu:
   app_id: ${FEISHU_APP_ID}
   app_secret: ${FEISHU_APP_SECRET}
@@ -13,6 +16,17 @@ claude:
   session_store_path: .gateway-sessions.json
   # allowed_tools: "Bash,Read,Write,Edit,Glob,WebSearch,WebFetch"
   # instruction: "Always respond in Chinese."  # Optional: prepended to user prompt
+
+
+# --- Mira Agent API ---
+# Token: browser DevTools -> Application -> Cookies -> mira_session
+# Typically valid ~7 days, re-copy when MiraAuthError occurs
+mira:
+  session_token: ${MIRA_SESSION}
+  base_url: https://mira.byteintl.net
+  model: re-o-46               # routes to claude-opus-4-6
+  timeout: 300
+  session_store_path: .mira-sessions.json
 
 # --- WeChat Channel (iLink protocol) ---
 # First run: python weixin_login.py (scan QR code to save credentials)

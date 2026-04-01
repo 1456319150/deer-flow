@@ -944,7 +944,15 @@ async def main() -> None:
     )
 
     cfg = load_config()
-    bridge = ClaudeCodeBridge(cfg.get("claude", {}))
+    # Bridge selection: "mira" or "claude" (default)
+    provider = cfg.get("provider", "claude")
+    if provider == "mira":
+        from mira_bridge import MiraBridge
+        bridge = MiraBridge(cfg.get("mira", {}))
+        log.info("[Init] Using Mira bridge (model=%s)", bridge.model)
+    else:
+        bridge = ClaudeCodeBridge(cfg.get("claude", {}))
+        log.info("[Init] Using Claude Code bridge")
 
     log.info("[Init] file logging enabled at %s", log_path)
 
