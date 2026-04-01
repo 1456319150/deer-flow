@@ -149,19 +149,42 @@ class FeishuBot:
         tool_cards: dict[str, dict[str, str | None]] = {}
         saw_stream_event = False
 
-        # Streaming card state: create card on first delta, update on subsequent
+        # --- Streaming card state ---
         _thinking_card_id: str | None = None
         _thinking_acc: list[str] = []
         _result_card_id: str | None = None
         _result_acc: list[str] = []
-        _STREAM_THROTTLE = 0.5  # min seconds between card updates
-        import time as _time
-        _last_thinking_update = 0.0
-        _last_result_update = 0.0
+        _thinking_dirty = False  # new content since last flush
+        _result_dirty = False
+        _FLUSH_INTERVAL = 1.0  # seconds between card updates
 
-        # Fire-and-forget update tasks — avoid blocking the SSE loop
-        _thinking_update_task: asyncio.Task | None = None
-        _result_update_task: asyncio.Task | None = None
+        async def _flush_cards():
+            """Background flusher: periodically update cards with accumulated text."""
+            nonlocal _thinking_dirty, _result_dirty, _thinking_card_id, _result_card_id
+            while True:
+                await asyncio.sleep(_FLUSH_INTERVAL)
+                if _thinking_dirty and _thinking_acc:
+                    _thinking_dirty = False
+                    full = "💭 **Thinking...**\n\n" + "".join(_thinking_acc)
+                    if _thinking_card_id:
+                        try:
+                            await self._update_card(_thinking_card_id, full)
+                        except Exception:
+                            log.debug("flush thinking card update failed")
+                    else:
+                        _thinking_card_id = await self._reply_card(msg_id, full)
+                if _result_dirty and _result_acc:
+                    _result_dirty = False
+                    full = "".join(_result_acc)
+                    if _result_card_id:
+                        try:
+                            await self._update_card(_result_card_id, full)
+                        except Exception:
+                            log.debug("flush result card update failed")
+                    else:
+                        _result_card_id = await self._reply_card(msg_id, full)
+
+        flush_task = asyncio.create_task(_flush_cards())
 
         try:
             async for event in self.bridge.stream_ask(topic_id, text):
@@ -178,39 +201,12 @@ class FeishuBot:
                     # ── Streaming delta handling (Mira bridge) ─────
                     if stream_event.kind == "thinking" and stream_event.text:
                         _thinking_acc.append(stream_event.text)
-                        now = _time.monotonic()
-                        if now - _last_thinking_update >= _STREAM_THROTTLE:
-                            full = "".join(_thinking_acc)
-                            block = "💭 **Thinking...**\n\n" + full
-                            if _thinking_card_id:
-                                # Cancel previous pending update if still running
-                                if _thinking_update_task and not _thinking_update_task.done():
-                                    _thinking_update_task.cancel()
-                                _thinking_update_task = asyncio.create_task(
-                                    self._update_card(_thinking_card_id, block)
-                                )
-                            else:
-                                # Must await creation to get card_id
-                                _thinking_card_id = await self._reply_card(msg_id, block)
-                            _last_thinking_update = now
+                        _thinking_dirty = True
                         continue
 
                     if stream_event.kind == "result" and stream_event.text:
                         _result_acc.append(stream_event.text)
-                        now = _time.monotonic()
-                        if now - _last_result_update >= _STREAM_THROTTLE:
-                            full = "".join(_result_acc)
-                            if _result_card_id:
-                                # Cancel previous pending update if still running
-                                if _result_update_task and not _result_update_task.done():
-                                    _result_update_task.cancel()
-                                _result_update_task = asyncio.create_task(
-                                    self._update_card(_result_card_id, full)
-                                )
-                            else:
-                                # Must await creation to get card_id
-                                _result_card_id = await self._reply_card(msg_id, full)
-                            _last_result_update = now
+                        _result_dirty = True
                         continue
 
                     if stream_event.kind == "text":
@@ -290,25 +286,23 @@ class FeishuBot:
             log.exception("Bridge error")
             result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
 
-        # ── Wait for pending update tasks before final flush ───
-        for task in (_thinking_update_task, _result_update_task):
-            if task and not task.done():
-                try:
-                    await task
-                except Exception:
-                    pass
+        # ── Cancel background flusher ──────────────────────────
+        flush_task.cancel()
+        try:
+            await flush_task
+        except asyncio.CancelledError:
+            pass
 
-        # ── Final flush for streaming cards ────────────────────
+        # ── Final flush — ensure all accumulated content is displayed ──
         if _thinking_acc:
-            full = "".join(_thinking_acc)
-            block = "💭 **Thinking**\n\n" + full
+            full = "💭 **Thinking**\n\n" + "".join(_thinking_acc)
             if _thinking_card_id:
                 try:
-                    await self._update_card(_thinking_card_id, block)
+                    await self._update_card(_thinking_card_id, full)
                 except Exception:
                     pass
-            elif saw_stream_event:
-                await self._reply_card(msg_id, block)
+            else:
+                await self._reply_card(msg_id, full)
 
         if _result_acc:
             full = "".join(_result_acc)
@@ -317,6 +311,8 @@ class FeishuBot:
                     await self._update_card(_result_card_id, full)
                 except Exception:
                     pass
+            elif full.strip():
+                await self._reply_card(msg_id, full)
 
         if not saw_stream_event:
             card_content = self._format_result(result)
