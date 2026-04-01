@@ -422,6 +422,39 @@ class TestStreamAskEventMapping:
         assert all(e["event"].kind in ("result", "thinking") for e in stream_events)
         assert len(stream_events) == 1
 
+
+    @pytest.mark.asyncio
+    async def test_safety_audit_type_skipped(self, bridge):
+        """Safety audit metadata events are skipped and don't leak to output."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            # Normal text delta
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="Hello world",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Safety audit metadata (should be skipped)
+            yield _make_event("reason", text="", data_type="safety_audit",
+                              data={"recognizer_results": [], "dangerous": False})
+            # Content event
+            yield _make_event("content", text="Hello world",
+                              data={"content": {"result": "Hello world"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        result_events = [e for e in stream_events if e["event"].kind == "result"]
+        # Should only get 1 result event (the text delta), safety_audit skipped
+        assert len(result_events) == 1
+        assert result_events[0]["event"].text == "Hello world"
+        # No event should contain recognizer_results text
+        for e in stream_events:
+            assert "recognizer_results" not in e["event"].text
     @pytest.mark.asyncio
     async def test_user_type_yields_tool_result(self, bridge):
         """User-type reason events yield tool_result StreamEvents."""

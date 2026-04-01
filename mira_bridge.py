@@ -145,7 +145,7 @@ class MiraBridge:
 
                 # Skip assistant summaries (full accumulated text, NOT a delta)
                 # and system metadata — these cause duplicate output if processed
-                if evt.data_type in ("assistant", "system"):
+                if evt.data_type in ("assistant", "system", "safety_audit"):
                     log.debug(
                         "[MiraBridge] skip %s reason (not a delta)",
                         evt.data_type,

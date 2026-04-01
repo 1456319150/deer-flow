@@ -360,7 +360,12 @@ class MiraClient:
             # Extract data.type for reason event subtype classification
             data_type = raw_data.get("type", "")
 
-            if event_type == "reason":
+            # Skip content safety audit metadata (PII recognizer results)
+            if "recognizer_results" in raw_data or "last_masked_user_message" in raw_data:
+                data_type = "safety_audit"
+                # Don't extract text from audit metadata
+
+            if event_type == "reason" and data_type != "safety_audit":
                 # Extract inner event structure (Claude-style wrapped in Mira reason)
                 evt_inner = raw_data.get("event", {})
                 if isinstance(evt_inner, dict):

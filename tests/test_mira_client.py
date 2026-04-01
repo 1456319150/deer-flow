@@ -510,6 +510,72 @@ class TestParseEvent:
         assert evt.message_id == "123"
         assert evt.session_id == "456"
 
+    def test_parse_safety_audit_recognizer_results(self):
+        """Content safety audit metadata with recognizer_results sets data_type='safety_audit' and text=''."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "dangerous": False,
+                "downgrade_model": "",
+                "recognizer_results": [
+                    {
+                        "entity_type": "REAL_NAME",
+                        "value": "高博",
+                        "start": 697,
+                        "end": 699,
+                        "placeholder": "高博",
+                    }
+                ],
+                "last_masked_user_message": "some masked message content",
+                "degrade_reason": "",
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "safety_audit"
+        assert evt.text == ""
+
+    def test_parse_safety_audit_last_masked_user_message_only(self):
+        """Content safety metadata with only last_masked_user_message key."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "last_masked_user_message": "full masked message text here",
+                "dangerous": False,
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "safety_audit"
+        assert evt.text == ""
+
+    def test_parse_safety_audit_recognizer_results_only(self):
+        """Content safety metadata with only recognizer_results key."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "recognizer_results": [],
+                "dangerous": False,
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "safety_audit"
+        assert evt.text == ""
+
+    def test_parse_normal_reason_not_flagged_as_safety_audit(self):
+        """Normal reason events without safety keys are NOT classified as safety_audit."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "hello"},
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type != "safety_audit"
+        assert evt.text == "hello"
+
 
 # ── create_session() Tests ─────────────────────────────────────────
 
