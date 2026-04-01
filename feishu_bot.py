@@ -322,7 +322,7 @@ class FeishuBot:
             card_content = self._format_result(result)
             log.info("[RenderFallback] content_len=%d", len(card_content))
             await self._reply_card(msg_id, card_content)
-        elif result.reply_text:
+        elif result.reply_text and not _result_acc:
             final_text = result.reply_text
             reply_so_far = "\n\n".join(streamed_texts).strip()
             if final_text != reply_so_far:
