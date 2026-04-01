@@ -37,6 +37,9 @@ class TestDataModels:
         assert evt.block_type == ""
         assert evt.delta_type == ""
         assert evt.inner_type == ""
+        assert evt.data_type == ""
+        assert evt.tool_name == ""
+        assert evt.tool_use_id == ""
 
     def test_mira_event_full(self):
         evt = MiraEvent(
@@ -68,6 +71,21 @@ class TestDataModels:
         )
         assert evt.block_type == "text"
         assert evt.delta_type == "text_delta"
+
+    def test_mira_event_tool_use_fields(self):
+        """MiraEvent carries tool_name/tool_use_id for tool_use blocks."""
+        evt = MiraEvent(
+            event="reason", data={},
+            block_type="tool_use",
+            inner_type="content_block_start",
+            data_type="stream_event",
+            tool_name="web_search",
+            tool_use_id="toolu_123",
+        )
+        assert evt.block_type == "tool_use"
+        assert evt.tool_name == "web_search"
+        assert evt.tool_use_id == "toolu_123"
+        assert evt.data_type == "stream_event"
 
     def test_mira_message(self):
         msg = MiraMessage(
@@ -274,6 +292,47 @@ class TestParseEvent:
         assert evt.inner_type == "content_block_start"
         assert evt.block_type == "text"
 
+    def test_parse_reason_content_block_start_tool_use(self):
+        """Reason event with content_block_start for tool_use block."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {
+                        "type": "tool_use",
+                        "name": "web_search",
+                        "id": "toolu_abc123",
+                    },
+                },
+                "type": "stream_event",
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.inner_type == "content_block_start"
+        assert evt.block_type == "tool_use"
+        assert evt.tool_name == "web_search"
+        assert evt.tool_use_id == "toolu_abc123"
+        assert evt.data_type == "stream_event"
+
+    def test_parse_reason_input_json_delta(self):
+        """Reason event with input_json_delta (tool input streaming)."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "input_json_delta", "partial_json": '{"query":'},
+                },
+                "type": "stream_event",
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.delta_type == "input_json_delta"
+        assert evt.data_type == "stream_event"
+        # input_json_delta has no "text" or "thinking" key, so text should be empty
+        assert evt.text == ""
+
     def test_parse_reason_content_block_stop(self):
         """Reason event with content_block_stop."""
         msg = {
@@ -331,7 +390,7 @@ class TestParseEvent:
         assert evt.text == ""
 
     def test_parse_reason_fallback_message_content(self):
-        """Reason event falls back to message.content[0].text."""
+        """Reason event falls back to message.content[0].text (non-assistant)."""
         msg = {
             "event": "reason",
             "data": {
@@ -342,6 +401,95 @@ class TestParseEvent:
         }
         evt = MiraClient._parse_event(msg)
         assert evt.text == "fallback text"
+
+    def test_parse_reason_assistant_type_no_text_extraction(self):
+        """Assistant-type reason events should NOT extract text (avoids duplicate)."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "thinking", "thinking": "long thinking..."},
+                        {"type": "text", "text": "This is the full accumulated answer."},
+                    ],
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "assistant"
+        # Text should NOT be extracted from assistant summaries
+        assert evt.text == ""
+
+    def test_parse_reason_system_type(self):
+        """System-type reason events should have data_type='system'."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "type": "system",
+                "model": "claude-sonnet-4-20250514",
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "system"
+
+    def test_parse_reason_user_type_tool_result(self):
+        """User-type reason events extract tool result text."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "content": "Search results: found 3 items",
+                            "tool_use_id": "toolu_abc",
+                        },
+                    ],
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "user"
+        assert evt.text == "Search results: found 3 items"
+
+    def test_parse_reason_user_type_tool_result_list_content(self):
+        """User-type reason events with list content in tool_result."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "content": [{"type": "text", "text": "list result text"}],
+                            "tool_use_id": "toolu_abc",
+                        },
+                    ],
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "user"
+        assert evt.text == "list result text"
+
+    def test_parse_reason_data_type_extracted(self):
+        """data.type is always extracted into data_type field."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "hi"},
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "stream_event"
+        assert evt.text == "hi"
 
     def test_parse_content_fallback_top_level_result(self):
         """Content event with result at top level (fallback format)"""

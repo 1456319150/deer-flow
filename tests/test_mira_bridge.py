@@ -2,6 +2,9 @@
 
 All Mira network calls are mocked. Tests validate:
 - Event mapping (reason deltas → immediate thinking/result stream events)
+- data_type filtering (assistant/system skipped, user → tool_result)
+- Tool use events surfaced as tool_use StreamEvents
+- input_json_delta skipped (not display text)
 - Session persistence (load/save/reset)
 - Error handling (auth, generic)
 - Interface parity with ClaudeCodeBridge
@@ -27,7 +30,8 @@ from gateway import StreamResult, StreamEvent, UsageSummary
 def _make_event(event: str, text: str = "", data: dict = None,
                 message_id: str = "", session_id: str = "",
                 block_type: str = "", delta_type: str = "",
-                inner_type: str = "") -> MiraEvent:
+                inner_type: str = "", data_type: str = "",
+                tool_name: str = "", tool_use_id: str = "") -> MiraEvent:
     return MiraEvent(
         event=event,
         data=data or {},
@@ -37,6 +41,9 @@ def _make_event(event: str, text: str = "", data: dict = None,
         block_type=block_type,
         delta_type=delta_type,
         inner_type=inner_type,
+        data_type=data_type,
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
     )
 
 
@@ -183,24 +190,30 @@ class TestStreamAskEventMapping:
             yield _make_event("start", text="")
             # thinking block
             yield _make_event("reason", inner_type="content_block_start",
-                              block_type="thinking")
+                              block_type="thinking", data_type="stream_event")
             yield _make_event("reason", text="Step 1. ",
                               inner_type="content_block_delta",
-                              delta_type="thinking_delta")
+                              delta_type="thinking_delta",
+                              data_type="stream_event")
             yield _make_event("reason", text="Step 2.",
                               inner_type="content_block_delta",
-                              delta_type="thinking_delta")
-            yield _make_event("reason", inner_type="content_block_stop")
+                              delta_type="thinking_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
             # text block
             yield _make_event("reason", inner_type="content_block_start",
-                              block_type="text")
+                              block_type="text", data_type="stream_event")
             yield _make_event("reason", text="Final ",
                               inner_type="content_block_delta",
-                              delta_type="text_delta")
+                              delta_type="text_delta",
+                              data_type="stream_event")
             yield _make_event("reason", text="answer",
                               inner_type="content_block_delta",
-                              delta_type="text_delta")
-            yield _make_event("reason", inner_type="content_block_stop")
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
             # content event with usage
             yield _make_event("content", text="Final answer",
                               data={"content": {"result": "Final answer"}})
@@ -212,8 +225,6 @@ class TestStreamAskEventMapping:
         stream_events = [e for e in events if e["type"] == "stream_event"]
         final_events = [e for e in events if e["type"] == "final"]
 
-        # Should get individual delta events: 2 thinking + 2 result (from text block)
-        # Plus possibly 1 result from content fallback (but result_chunks is non-empty so no fallback)
         thinking_events = [e for e in stream_events if e["event"].kind == "thinking"]
         result_events = [e for e in stream_events if e["event"].kind == "result"]
 
@@ -354,6 +365,229 @@ class TestStreamAskEventMapping:
         # Legacy reason with no block_type/delta_type → treated as answer (text block)
         # because current_block is "" and delta_type is ""
         assert len(stream_events) >= 1
+
+    # ── NEW: data_type filtering tests ─────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_assistant_type_skipped(self, bridge):
+        """Assistant-type reason events (full snapshots) are skipped to avoid duplicates."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            # Stream deltas first
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="Hello world",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Assistant summary (duplicate — should be skipped)
+            yield _make_event("reason", text="Hello world",
+                              data_type="assistant")
+            # Content event
+            yield _make_event("content", text="Hello world",
+                              data={"content": {"result": "Hello world"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        result_events = [e for e in stream_events if e["event"].kind == "result"]
+        # Should only get 1 result event (the stream delta), not 2
+        assert len(result_events) == 1
+        assert result_events[0]["event"].text == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_system_type_skipped(self, bridge):
+        """System-type reason events are skipped."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            yield _make_event("reason", data_type="system")
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="answer",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            yield _make_event("content", data={"content": {"result": "answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        # No system events should appear
+        assert all(e["event"].kind in ("result", "thinking") for e in stream_events)
+        assert len(stream_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_user_type_yields_tool_result(self, bridge):
+        """User-type reason events yield tool_result StreamEvents."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            yield _make_event("reason", text="Search results: 3 items found",
+                              data_type="user")
+            yield _make_event("content", data={"content": {"result": "answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        tool_result_events = [e for e in stream_events if e["event"].kind == "tool_result"]
+        assert len(tool_result_events) == 1
+        assert "Search results" in tool_result_events[0]["event"].text
+
+    @pytest.mark.asyncio
+    async def test_user_type_empty_text_fallback(self, bridge):
+        """User-type reason events with no text get fallback text."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            yield _make_event("reason", text="", data_type="user")
+            yield _make_event("content", data={"content": {"result": "answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        tool_result_events = [
+            e for e in events
+            if e["type"] == "stream_event" and e["event"].kind == "tool_result"
+        ]
+        assert len(tool_result_events) == 1
+        assert tool_result_events[0]["event"].text == "(tool executed)"
+
+    # ── NEW: tool_use event tests ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_tool_use_block_yields_tool_use_event(self, bridge):
+        """content_block_start with tool_use yields a tool_use StreamEvent."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="tool_use", data_type="stream_event",
+                              tool_name="web_search", tool_use_id="toolu_123")
+            # input_json_delta should be skipped
+            yield _make_event("reason", text="",
+                              inner_type="content_block_delta",
+                              delta_type="input_json_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            yield _make_event("content", data={"content": {"result": "answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        tool_use_events = [e for e in stream_events if e["event"].kind == "tool_use"]
+        assert len(tool_use_events) == 1
+        assert tool_use_events[0]["event"].tool_name == "web_search"
+        assert tool_use_events[0]["event"].tool_use_id == "toolu_123"
+        assert tool_use_events[0]["event"].text == "web_search"
+
+    @pytest.mark.asyncio
+    async def test_input_json_delta_skipped(self, bridge):
+        """input_json_delta events are not treated as text."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="tool_use", data_type="stream_event",
+                              tool_name="calculator", tool_use_id="toolu_456")
+            yield _make_event("reason", text="",
+                              inner_type="content_block_delta",
+                              delta_type="input_json_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Then a text block with actual answer
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="The result is 42",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            yield _make_event("content", data={"content": {"result": "The result is 42"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        result_events = [e for e in stream_events if e["event"].kind == "result"]
+        # Only the text delta, not input_json_delta
+        assert len(result_events) == 1
+        assert result_events[0]["event"].text == "The result is 42"
+
+    @pytest.mark.asyncio
+    async def test_full_tool_use_flow(self, bridge):
+        """Full flow: thinking → tool_use → tool_result → text answer."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            # Thinking
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="thinking", data_type="stream_event")
+            yield _make_event("reason", text="I need to search",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Tool use
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="tool_use", data_type="stream_event",
+                              tool_name="web_search", tool_use_id="toolu_789")
+            yield _make_event("reason", inner_type="content_block_delta",
+                              delta_type="input_json_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Assistant summary (should be skipped)
+            yield _make_event("reason", text="I need to search",
+                              data_type="assistant")
+            # Tool result from user
+            yield _make_event("reason", text="Found: Python docs",
+                              data_type="user")
+            # Text answer
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="Based on the search, ",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", text="here is the answer.",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Another assistant summary (should be skipped)
+            yield _make_event("reason", text="Based on the search, here is the answer.",
+                              data_type="assistant")
+            # Content
+            yield _make_event("content", data={"content": {"result": "Based on the search, here is the answer."}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        kinds = [e["event"].kind for e in stream_events]
+
+        assert "thinking" in kinds
+        assert "tool_use" in kinds
+        assert "tool_result" in kinds
+        assert "result" in kinds
+
+        # Verify no duplicate text from assistant summaries
+        result_events = [e for e in stream_events if e["event"].kind == "result"]
+        assert len(result_events) == 2  # "Based on the search, " + "here is the answer."
+        assert result_events[0]["event"].text == "Based on the search, "
+        assert result_events[1]["event"].text == "here is the answer."
+
+        final = [e for e in events if e["type"] == "final"][0]
+        assert final["result"].result_text == "Based on the search, here is the answer."
+        assert final["result"].thinking == ["I need to search"]
 
 
 # ── Session Creation on stream_ask ─────────────────────────────────

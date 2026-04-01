@@ -6,9 +6,12 @@ event format, so FeishuBot/WeixinBot work without any changes.
 Key design decisions:
     - Mira manages conversation context server-side, so we just reuse
       sessionId per topic_id (no need to replay message history).
-    - Reason (thinking) events are buffered and emitted once on
-      start_content transition to avoid flooding with tiny cards.
-    - Content event maps to a single "result" StreamEvent.
+    - Reason events are classified by data.type:
+        * stream_event — actual Claude streaming deltas (process these)
+        * assistant — full accumulated snapshot (skip to avoid duplicates)
+        * user — tool result injected back (surface as tool_result event)
+        * system — metadata (skip)
+    - Content event maps to a single "result" StreamEvent (fallback).
 """
 from __future__ import annotations
 
@@ -113,7 +116,7 @@ class MiraBridge:
 
         # ── Streaming state ────────────────────────────────────────
         # Track current content block type from content_block_start
-        current_block: str = ""           # "thinking" | "text" | ""
+        current_block: str = ""           # "thinking" | "text" | "tool_use" | ""
         thinking_chunks: list[str] = []   # accumulated thinking text
         result_chunks: list[str] = []     # accumulated answer text
 
@@ -138,15 +141,55 @@ class MiraBridge:
                         log.info("[MiraBridge] session title: %s", evt.text)
                     continue
 
-                # ── reason event: streaming deltas ─────────────────
+                # ── reason event: classify by data_type ────────────
+
+                # Skip assistant summaries (full accumulated text, NOT a delta)
+                # and system metadata — these cause duplicate output if processed
+                if evt.data_type in ("assistant", "system"):
+                    log.debug(
+                        "[MiraBridge] skip %s reason (not a delta)",
+                        evt.data_type,
+                    )
+                    continue
+
+                # Handle user events (tool results injected back)
+                if evt.data_type == "user":
+                    tool_result_text = evt.text or "(tool executed)"
+                    yield {
+                        "type": "stream_event",
+                        "event": StreamEvent(
+                            kind="tool_result",
+                            text=tool_result_text[:500],
+                        ),
+                    }
+                    continue
+
+                # ── stream_event or untyped reason: streaming deltas ─
+
                 # Block type transitions (content_block_start)
                 if evt.inner_type == "content_block_start" and evt.block_type:
                     current_block = evt.block_type
                     log.debug("[MiraBridge] block start: %s", current_block)
+
+                    # Surface tool_use blocks so feishu_bot can render cards
+                    if evt.block_type == "tool_use" and evt.tool_name:
+                        yield {
+                            "type": "stream_event",
+                            "event": StreamEvent(
+                                kind="tool_use",
+                                text=evt.tool_name,
+                                tool_name=evt.tool_name,
+                                tool_use_id=evt.tool_use_id,
+                            ),
+                        }
                     continue
 
                 if evt.inner_type == "content_block_stop":
                     current_block = ""
+                    continue
+
+                # Skip input_json_delta (tool input JSON streaming, not display text)
+                if evt.delta_type == "input_json_delta":
                     continue
 
                 # Only process events with text deltas

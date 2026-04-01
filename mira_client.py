@@ -58,18 +58,24 @@ class MiraEvent:
     """A single SSE event from Mira's streaming response.
 
     For reason events carrying stream deltas:
-        block_type: "thinking" | "text" | "" (from content_block_start)
-        delta_type: "thinking_delta" | "text_delta" | "" (from content_block_delta)
+        block_type: "thinking" | "text" | "tool_use" | "" (from content_block_start)
+        delta_type: "thinking_delta" | "text_delta" | "input_json_delta" | "" (from content_block_delta)
         inner_type: the raw event.type string (content_block_start/delta/stop, etc.)
+        data_type:  "stream_event" | "assistant" | "user" | "system" | "" (from data.type)
+        tool_name:  tool name from content_block_start with tool_use block
+        tool_use_id: tool use ID from content_block_start with tool_use block
     """
     event: str
     data: dict
     text: str = ""
     message_id: str = ""
     session_id: str = ""
-    block_type: str = ""      # "thinking" | "text" from content_block_start
-    delta_type: str = ""      # "thinking_delta" | "text_delta" from delta
+    block_type: str = ""      # "thinking" | "text" | "tool_use" from content_block_start
+    delta_type: str = ""      # "thinking_delta" | "text_delta" | "input_json_delta" from delta
     inner_type: str = ""      # raw event.type (content_block_start/delta/stop/message_start...)
+    data_type: str = ""       # "stream_event" | "assistant" | "user" | "system" | ""
+    tool_name: str = ""       # tool name from content_block_start with tool_use
+    tool_use_id: str = ""     # tool use ID from content_block_start with tool_use
 
 
 @dataclass
@@ -346,30 +352,64 @@ class MiraClient:
         block_type = ""
         delta_type = ""
         inner_type = ""
+        data_type = ""
+        tool_name = ""
+        tool_use_id = ""
 
         if isinstance(raw_data, dict):
+            # Extract data.type for reason event subtype classification
+            data_type = raw_data.get("type", "")
+
             if event_type == "reason":
                 # Extract inner event structure (Claude-style wrapped in Mira reason)
                 evt_inner = raw_data.get("event", {})
                 if isinstance(evt_inner, dict):
                     inner_type = evt_inner.get("type", "")
 
-                    # content_block_start → extract block type (thinking/text)
+                    # content_block_start → extract block type (thinking/text/tool_use)
                     cb = evt_inner.get("content_block", {})
                     if isinstance(cb, dict) and cb:
-                        block_type = cb.get("type", "")  # "thinking" or "text"
+                        block_type = cb.get("type", "")  # "thinking", "text", or "tool_use"
+                        # For tool_use blocks, extract tool name and ID
+                        if block_type == "tool_use":
+                            tool_name = cb.get("name", "")
+                            tool_use_id = cb.get("id", "")
 
                     # content_block_delta → extract delta text and type
                     delta = evt_inner.get("delta", {})
                     if isinstance(delta, dict) and delta:
-                        delta_type = delta.get("type", "")  # "thinking_delta" or "text_delta"
+                        delta_type = delta.get("type", "")  # "thinking_delta", "text_delta", "input_json_delta"
                         text = delta.get("text", delta.get("thinking", ""))
 
-                # Fallback: direct text field
-                if not text:
+                # For "user" type events (tool results), extract text from message content
+                if data_type == "user":
+                    msg_inner = raw_data.get("message", {})
+                    if isinstance(msg_inner, dict):
+                        blocks = msg_inner.get("content", [])
+                        if isinstance(blocks, list):
+                            for blk in blocks:
+                                if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                                    # Extract text from tool_result content
+                                    tr_content = blk.get("content", "")
+                                    if isinstance(tr_content, str) and tr_content:
+                                        text = tr_content
+                                        break
+                                    elif isinstance(tr_content, list):
+                                        for item in tr_content:
+                                            if isinstance(item, dict) and item.get("text"):
+                                                text = item["text"]
+                                                break
+                                        if text:
+                                            break
+                                elif isinstance(blk, dict) and blk.get("text"):
+                                    if not text:
+                                        text = blk["text"]
+
+                # Fallback: direct text field (only for stream_event types, not assistant summaries)
+                if not text and data_type != "assistant":
                     text = raw_data.get("text", "")
-                # Fallback: message.content[0].text
-                if not text:
+                # Fallback: message.content[0].text (only for stream_event types)
+                if not text and data_type != "assistant":
                     msg_inner = raw_data.get("message", {})
                     if isinstance(msg_inner, dict):
                         blocks = msg_inner.get("content", [])
@@ -410,6 +450,9 @@ class MiraClient:
             block_type=block_type,
             delta_type=delta_type,
             inner_type=inner_type,
+            data_type=data_type,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
         )
 
     @staticmethod
