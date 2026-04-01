@@ -365,6 +365,13 @@ class MiraClient:
                 data_type = "safety_audit"
                 # Don't extract text from audit metadata
 
+            # Also detect <cis-ctrl> wrapped safety audit events
+            if not data_type:
+                for v in raw_data.values():
+                    if isinstance(v, str) and v.strip().startswith('<cis-ctrl>'):
+                        data_type = "safety_audit"
+                        break
+
             if event_type == "reason" and data_type != "safety_audit":
                 # Extract inner event structure (Claude-style wrapped in Mira reason)
                 evt_inner = raw_data.get("event", {})
@@ -445,6 +452,11 @@ class MiraClient:
                 message_id = str(raw_data.get("messageId", raw_data.get("message_id", "")))
             if not session_id:
                 session_id = str(raw_data.get("sessionId", raw_data.get("session_id", "")))
+
+        # Final safety: clear text if it contains <cis-ctrl> tags
+        if text and text.strip().startswith('<cis-ctrl>'):
+            data_type = "safety_audit"
+            text = ""
 
         return MiraEvent(
             event=event_type,

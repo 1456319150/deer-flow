@@ -577,6 +577,64 @@ class TestParseEvent:
         assert evt.text == "hello"
 
 
+    def test_parse_cis_ctrl_in_dict_value_detected_as_safety_audit(self):
+        """Dict with a string value starting with <cis-ctrl> is detected as safety_audit."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"text": '<cis-ctrl>{"dangerous":false,"downgrade_model":""}'}
+                    ],
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "safety_audit" or evt.text == ""
+        # Either classified as safety_audit at dict level, or text cleared at final check
+
+    def test_parse_cis_ctrl_text_field_cleared(self):
+        """Text starting with <cis-ctrl> is cleared and event marked as safety_audit."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "text": '<cis-ctrl>{"dangerous":false,"downgrade_model":"","recognizer_results":[]}',
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "safety_audit"
+        assert evt.text == ""
+
+    def test_parse_cis_ctrl_with_whitespace_prefix(self):
+        """<cis-ctrl> with leading whitespace is also detected."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "text": '  <cis-ctrl>{"dangerous":false}',
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.data_type == "safety_audit"
+        assert evt.text == ""
+
+    def test_parse_normal_text_not_affected_by_cis_ctrl_check(self):
+        """Normal text that doesn't start with <cis-ctrl> is unaffected."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "normal answer text"},
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.text == "normal answer text"
+        assert evt.data_type != "safety_audit"
+
+
 # ── create_session() Tests ─────────────────────────────────────────
 
 class TestCreateSession:

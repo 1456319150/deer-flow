@@ -119,6 +119,7 @@ class MiraBridge:
         current_block: str = ""           # "thinking" | "text" | "tool_use" | ""
         thinking_chunks: list[str] = []   # accumulated thinking text
         result_chunks: list[str] = []     # accumulated answer text
+        _tool_phase_notified: bool = False  # sent "researching" status once?
 
         try:
             async for evt in self.client.chat(
@@ -169,6 +170,16 @@ class MiraBridge:
                     if evt.block_type == "tool_use":
                         log.info("[MiraBridge] tool call: %s",
                                  evt.tool_name or "unknown")
+                        # Notify user once that deep research is in progress
+                        if not _tool_phase_notified:
+                            _tool_phase_notified = True
+                            yield {
+                                "type": "stream_event",
+                                "event": StreamEvent(
+                                    kind="thinking",
+                                    text="\U0001f50d 正在深度调研中，请稍候...\n",
+                                ),
+                            }
                     continue
 
                 if evt.inner_type == "content_block_stop":

@@ -630,6 +630,82 @@ class TestStreamAskEventMapping:
         assert final["result"].thinking == ["I need to search"]
 
 
+
+    @pytest.mark.asyncio
+    async def test_tool_phase_yields_thinking_status(self, bridge):
+        """First tool_use block yields a thinking status event for user feedback."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            # Text block first (short intro)
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="Let me research...",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Tool use phase
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="tool_use", data_type="stream_event",
+                              tool_name="web_search", tool_use_id="toolu_001")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Second tool use — should NOT yield another status
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="tool_use", data_type="stream_event",
+                              tool_name="knowledge_search", tool_use_id="toolu_002")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Final answer
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="Here is the answer.",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            yield _make_event("content", data={"content": {"result": "Here is the answer."}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        thinking_events = [e for e in stream_events if e["event"].kind == "thinking"]
+
+        # Should have exactly ONE thinking status from tool phase
+        tool_status = [e for e in thinking_events if "调研" in e["event"].text]
+        assert len(tool_status) == 1, f"Expected 1 tool status, got {len(tool_status)}"
+
+        # Result events should still be correct
+        result_events = [e for e in stream_events if e["event"].kind == "result"]
+        assert len(result_events) == 2  # "Let me research..." + "Here is the answer."
+
+    @pytest.mark.asyncio
+    async def test_tool_phase_no_status_when_no_tool_use(self, bridge):
+        """No tool phase status when there are no tool_use blocks."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="Simple answer",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            yield _make_event("content", data={"content": {"result": "Simple answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        thinking_events = [e for e in stream_events if e["event"].kind == "thinking"]
+        # No thinking status should appear
+        tool_status = [e for e in thinking_events if "调研" in e["event"].text]
+        assert len(tool_status) == 0
+
 # ── Session Creation on stream_ask ─────────────────────────────────
 
 class TestStreamAskSessionCreation:
