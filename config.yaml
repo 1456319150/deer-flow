@@ -25,6 +25,7 @@ mira:
   session_token: ${MIRA_SESSION}
   base_url: https://mira.byteintl.net
   model: re-o-46               # routes to claude-opus-4-6
+  mode: deep                   # "quick" = no-think, "deep" = thinking enabled
   timeout: 300
   session_store_path: .mira-sessions.json
 

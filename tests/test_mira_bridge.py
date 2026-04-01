@@ -56,6 +56,7 @@ def bridge_cfg(tmp_session_file):
         "session_token": "test_jwt_token",
         "base_url": "https://mira.test.net",
         "model": "test-model",
+        "mode": "deep",
         "timeout": 60,
         "session_store_path": tmp_session_file,
     }
@@ -72,6 +73,7 @@ def bridge(bridge_cfg):
 class TestBridgeInit:
     def test_init_with_config(self, bridge):
         assert bridge.model == "test-model"
+        assert bridge.mode == "deep"
         assert bridge.timeout == 60
 
     def test_init_missing_token_raises(self, tmp_session_file):
@@ -87,6 +89,14 @@ class TestBridgeInit:
         with patch.dict(os.environ, {"MIRA_SESSION": "env_token"}):
             b = MiraBridge({"session_store_path": tmp_session_file})
             assert b.client._token == "env_token"
+
+    def test_init_mode_default(self, tmp_session_file):
+        from mira_bridge import MiraBridge
+        b = MiraBridge({
+            "session_token": "tok",
+            "session_store_path": tmp_session_file,
+        })
+        assert b.mode == "quick"  # default when not specified
 
 
 # ── Session Persistence Tests ──────────────────────────────────────
@@ -164,7 +174,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_normal_flow(self, bridge):
         """reason → start_content → content → finish = thinking + result"""
-        async def mock_chat(session_id, content, model=None):
+        async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("start", text="")
             yield _make_event("reason", text="Step 1. ")
             yield _make_event("reason", text="Step 2.")
@@ -193,7 +203,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_no_thinking(self, bridge):
         """Direct content without reason events."""
-        async def mock_chat(session_id, content, model=None):
+        async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("start_content", text="")
             yield _make_event("content", text="Direct answer",
                              data={"content": {"result": "Direct answer"}})
@@ -209,7 +219,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_thinking_without_start_content(self, bridge):
         """Reason events without start_content (edge case) — flush at end."""
-        async def mock_chat(session_id, content, model=None):
+        async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("reason", text="Orphan thinking")
 
         bridge._sessions["t1"] = "existing_session"
@@ -224,7 +234,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_title_event_ignored(self, bridge):
         """Title events should not produce stream events."""
-        async def mock_chat(session_id, content, model=None):
+        async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("title", text="My Session Title")
             yield _make_event("content", text="answer",
                              data={"content": {"result": "answer"}})
@@ -244,7 +254,7 @@ class TestStreamAskSessionCreation:
     @pytest.mark.asyncio
     async def test_auto_creates_session(self, bridge):
         """When no session exists for topic, should auto-create one."""
-        async def mock_chat(session_id, content, model=None):
+        async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("content", text="response",
                              data={"content": {"result": "response"}})
 
@@ -291,7 +301,7 @@ class TestStreamAskErrors:
     @pytest.mark.asyncio
     async def test_auth_error_during_chat(self, bridge):
         """Auth error mid-stream yields error in final result."""
-        async def mock_chat(session_id, content, model=None):
+        async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("reason", text="thinking")
             raise MiraAuthError("token expired mid-stream")
 
@@ -305,7 +315,7 @@ class TestStreamAskErrors:
     @pytest.mark.asyncio
     async def test_generic_error_during_chat(self, bridge):
         """Generic exception mid-stream."""
-        async def mock_chat(session_id, content, model=None):
+        async def mock_chat(session_id, content, model=None, mode=None):
             raise RuntimeError("something broke")
             yield  # make it an async generator
 

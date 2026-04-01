@@ -43,6 +43,7 @@ class MiraBridge:
             )
         base_url = cfg.get("base_url", "https://mira.byteintl.net")
         self.model: str = cfg.get("model", "re-o-46")
+        self.mode: str = cfg.get("mode", "quick")
         self.timeout: int = cfg.get("timeout", 300)
         self.session_store_path: str = cfg.get(
             "session_store_path", ".mira-sessions.json"
@@ -113,7 +114,7 @@ class MiraBridge:
 
         try:
             async for evt in self.client.chat(
-                session_id, prompt, model=self.model
+                session_id, prompt, model=self.model, mode=self.mode
             ):
                 # ── Thinking (reason) — buffer, emit once ──────────
                 if evt.event == "reason" and evt.text:
