@@ -12,14 +12,20 @@ cd "$SCRIPT_DIR"
 
 pyenv local 3.12.4
 
+REQUIREMENTS_HASH_FILE=".venv/.requirements.sha256"
+CURRENT_REQUIREMENTS_HASH="$(shasum -a 256 requirements.txt | awk '{print $1}')"
+
 if [ ! -d ".venv" ]; then
     echo ">>> 首次运行，创建虚拟环境..."
     python3 -m venv .venv
-    source .venv/bin/activate
+fi
+
+source .venv/bin/activate
+
+if [ ! -f "$REQUIREMENTS_HASH_FILE" ] || [ "$(cat "$REQUIREMENTS_HASH_FILE")" != "$CURRENT_REQUIREMENTS_HASH" ]; then
     echo ">>> 安装依赖..."
-    pip install -r requirements.txt
-else
-    source .venv/bin/activate
+    python3 -m pip install -r requirements.txt
+    printf '%s' "$CURRENT_REQUIREMENTS_HASH" > "$REQUIREMENTS_HASH_FILE"
 fi
 
 echo "Python: $(python3 --version)"
