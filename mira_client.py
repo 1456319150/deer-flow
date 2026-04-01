@@ -55,12 +55,21 @@ DEFAULT_TOOLS: list[dict[str, Any]] = [
 
 @dataclass
 class MiraEvent:
-    """A single SSE event from Mira's streaming response."""
+    """A single SSE event from Mira's streaming response.
+
+    For reason events carrying stream deltas:
+        block_type: "thinking" | "text" | "" (from content_block_start)
+        delta_type: "thinking_delta" | "text_delta" | "" (from content_block_delta)
+        inner_type: the raw event.type string (content_block_start/delta/stop, etc.)
+    """
     event: str
     data: dict
     text: str = ""
     message_id: str = ""
     session_id: str = ""
+    block_type: str = ""      # "thinking" | "text" from content_block_start
+    delta_type: str = ""      # "thinking_delta" | "text_delta" from delta
+    inner_type: str = ""      # raw event.type (content_block_start/delta/stop/message_start...)
 
 
 @dataclass
@@ -334,16 +343,32 @@ class MiraClient:
         text = ""
         message_id = ""
         session_id = ""
+        block_type = ""
+        delta_type = ""
+        inner_type = ""
 
         if isinstance(raw_data, dict):
             if event_type == "reason":
-                # Thinking text may be at: data.text, data.message.content[0].text,
-                # or data.event.delta.text (Claude-style nested events)
-                text = raw_data.get("text", "")
+                # Extract inner event structure (Claude-style wrapped in Mira reason)
+                evt_inner = raw_data.get("event", {})
+                if isinstance(evt_inner, dict):
+                    inner_type = evt_inner.get("type", "")
+
+                    # content_block_start → extract block type (thinking/text)
+                    cb = evt_inner.get("content_block", {})
+                    if isinstance(cb, dict) and cb:
+                        block_type = cb.get("type", "")  # "thinking" or "text"
+
+                    # content_block_delta → extract delta text and type
+                    delta = evt_inner.get("delta", {})
+                    if isinstance(delta, dict) and delta:
+                        delta_type = delta.get("type", "")  # "thinking_delta" or "text_delta"
+                        text = delta.get("text", delta.get("thinking", ""))
+
+                # Fallback: direct text field
                 if not text:
-                    evt_inner = raw_data.get("event", {})
-                    if isinstance(evt_inner, dict):
-                        text = evt_inner.get("delta", {}).get("text", "")
+                    text = raw_data.get("text", "")
+                # Fallback: message.content[0].text
                 if not text:
                     msg_inner = raw_data.get("message", {})
                     if isinstance(msg_inner, dict):
@@ -353,7 +378,6 @@ class MiraClient:
 
             elif event_type == "content":
                 # Response text at: data.content.result (actual API)
-                # or data.result (fallback for alternative formats)
                 inner = raw_data.get("content", {})
                 if isinstance(inner, dict) and inner:
                     text = inner.get("result", "")
@@ -362,7 +386,6 @@ class MiraClient:
                     text = raw_data.get("result", "")
 
             elif event_type == "title":
-                # Title at: data.content (actual API) or data.title (fallback)
                 text = raw_data.get("content", raw_data.get("title", raw_data.get("text", "")))
 
             elif event_type == "start":
@@ -384,6 +407,9 @@ class MiraClient:
             text=text,
             message_id=message_id,
             session_id=session_id,
+            block_type=block_type,
+            delta_type=delta_type,
+            inner_type=inner_type,
         )
 
     @staticmethod

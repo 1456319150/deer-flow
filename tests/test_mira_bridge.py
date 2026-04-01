@@ -1,7 +1,7 @@
 """Unit tests for mira_bridge.py — MiraBridge adapter.
 
 All Mira network calls are mocked. Tests validate:
-- Event mapping (reason → thinking buffer, content → result)
+- Event mapping (reason deltas → immediate thinking/result stream events)
 - Session persistence (load/save/reset)
 - Error handling (auth, generic)
 - Interface parity with ClaudeCodeBridge
@@ -25,13 +25,18 @@ from gateway import StreamResult, StreamEvent, UsageSummary
 # ── Helpers ────────────────────────────────────────────────────────
 
 def _make_event(event: str, text: str = "", data: dict = None,
-                message_id: str = "", session_id: str = "") -> MiraEvent:
+                message_id: str = "", session_id: str = "",
+                block_type: str = "", delta_type: str = "",
+                inner_type: str = "") -> MiraEvent:
     return MiraEvent(
         event=event,
         data=data or {},
         text=text,
         message_id=message_id,
         session_id=session_id,
+        block_type=block_type,
+        delta_type=delta_type,
+        inner_type=inner_type,
     )
 
 
@@ -172,41 +177,71 @@ class TestSessionPersistence:
 
 class TestStreamAskEventMapping:
     @pytest.mark.asyncio
-    async def test_normal_flow(self, bridge):
-        """reason → start_content → content → finish = thinking + result"""
+    async def test_normal_flow_streaming_deltas(self, bridge):
+        """Thinking deltas + text deltas → individual stream events."""
         async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("start", text="")
-            yield _make_event("reason", text="Step 1. ")
-            yield _make_event("reason", text="Step 2.")
-            yield _make_event("start_content", text="")
+            # thinking block
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="thinking")
+            yield _make_event("reason", text="Step 1. ",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta")
+            yield _make_event("reason", text="Step 2.",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta")
+            yield _make_event("reason", inner_type="content_block_stop")
+            # text block
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text")
+            yield _make_event("reason", text="Final ",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta")
+            yield _make_event("reason", text="answer",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta")
+            yield _make_event("reason", inner_type="content_block_stop")
+            # content event with usage
             yield _make_event("content", text="Final answer",
-                             data={"content": {"result": "Final answer"}})
+                              data={"content": {"result": "Final answer"}})
 
         bridge._sessions["t1"] = "existing_session"
         with patch.object(bridge.client, "chat", side_effect=mock_chat):
             events = await _collect_events(bridge.stream_ask("t1", "question"))
 
-        # Should get: thinking event, result event, final event
         stream_events = [e for e in events if e["type"] == "stream_event"]
         final_events = [e for e in events if e["type"] == "final"]
 
-        assert len(stream_events) == 2
-        assert stream_events[0]["event"].kind == "thinking"
-        assert stream_events[0]["event"].text == "Step 1. Step 2."
-        assert stream_events[1]["event"].kind == "result"
-        assert stream_events[1]["event"].text == "Final answer"
+        # Should get individual delta events: 2 thinking + 2 result (from text block)
+        # Plus possibly 1 result from content fallback (but result_chunks is non-empty so no fallback)
+        thinking_events = [e for e in stream_events if e["event"].kind == "thinking"]
+        result_events = [e for e in stream_events if e["event"].kind == "result"]
+
+        assert len(thinking_events) == 2
+        assert thinking_events[0]["event"].text == "Step 1. "
+        assert thinking_events[1]["event"].text == "Step 2."
+
+        assert len(result_events) == 2
+        assert result_events[0]["event"].text == "Final "
+        assert result_events[1]["event"].text == "answer"
 
         assert len(final_events) == 1
         assert final_events[0]["result"].result_text == "Final answer"
         assert final_events[0]["result"].stop_reason == "end_turn"
+        assert final_events[0]["result"].thinking == ["Step 1. Step 2."]
 
     @pytest.mark.asyncio
     async def test_no_thinking(self, bridge):
-        """Direct content without reason events."""
+        """Direct text deltas without thinking block."""
         async def mock_chat(session_id, content, model=None, mode=None):
-            yield _make_event("start_content", text="")
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text")
+            yield _make_event("reason", text="Direct answer",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta")
+            yield _make_event("reason", inner_type="content_block_stop")
             yield _make_event("content", text="Direct answer",
-                             data={"content": {"result": "Direct answer"}})
+                              data={"content": {"result": "Direct answer"}})
 
         bridge._sessions["t1"] = "existing_session"
         with patch.object(bridge.client, "chat", side_effect=mock_chat):
@@ -215,12 +250,18 @@ class TestStreamAskEventMapping:
         stream_events = [e for e in events if e["type"] == "stream_event"]
         assert len(stream_events) == 1
         assert stream_events[0]["event"].kind == "result"
+        assert stream_events[0]["event"].text == "Direct answer"
 
     @pytest.mark.asyncio
-    async def test_thinking_without_start_content(self, bridge):
-        """Reason events without start_content (edge case) — flush at end."""
+    async def test_thinking_only_no_text_block(self, bridge):
+        """Thinking deltas without a text block — flushed at end."""
         async def mock_chat(session_id, content, model=None, mode=None):
-            yield _make_event("reason", text="Orphan thinking")
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="thinking")
+            yield _make_event("reason", text="Orphan thinking",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta")
+            yield _make_event("reason", inner_type="content_block_stop")
 
         bridge._sessions["t1"] = "existing_session"
         with patch.object(bridge.client, "chat", side_effect=mock_chat):
@@ -246,6 +287,73 @@ class TestStreamAskEventMapping:
         stream_events = [e for e in events if e["type"] == "stream_event"]
         # Only content → result event, no title event
         assert all(e["event"].kind in ("result", "thinking") for e in stream_events)
+
+    @pytest.mark.asyncio
+    async def test_content_fallback_when_no_stream_deltas(self, bridge):
+        """Content event result used as fallback when no text deltas streamed."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            yield _make_event("content", text="Fallback result",
+                              data={"content": {"result": "Fallback result"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        assert len(stream_events) == 1
+        assert stream_events[0]["event"].kind == "result"
+        assert stream_events[0]["event"].text == "Fallback result"
+
+    @pytest.mark.asyncio
+    async def test_multiple_thinking_chunks_streamed_individually(self, bridge):
+        """Each thinking delta yields its own stream event (not buffered)."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="thinking")
+            yield _make_event("reason", text="A",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta")
+            yield _make_event("reason", text="B",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta")
+            yield _make_event("reason", text="C",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta")
+            yield _make_event("reason", inner_type="content_block_stop")
+            yield _make_event("content", data={"content": {"result": "done"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        thinking_events = [
+            e for e in events
+            if e["type"] == "stream_event" and e["event"].kind == "thinking"
+        ]
+        assert len(thinking_events) == 3
+        assert thinking_events[0]["event"].text == "A"
+        assert thinking_events[1]["event"].text == "B"
+        assert thinking_events[2]["event"].text == "C"
+
+        final = [e for e in events if e["type"] == "final"][0]
+        assert final["result"].thinking == ["ABC"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_reason_without_inner_type(self, bridge):
+        """Reason events without inner_type (legacy format) still work."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            # Legacy-style reason event: just has text, no block structure
+            yield _make_event("reason", text="legacy thinking")
+            yield _make_event("content", data={"content": {"result": "answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "question"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        # Legacy reason with no block_type/delta_type → treated as answer (text block)
+        # because current_block is "" and delta_type is ""
+        assert len(stream_events) >= 1
 
 
 # ── Session Creation on stream_ask ─────────────────────────────────
@@ -302,7 +410,9 @@ class TestStreamAskErrors:
     async def test_auth_error_during_chat(self, bridge):
         """Auth error mid-stream yields error in final result."""
         async def mock_chat(session_id, content, model=None, mode=None):
-            yield _make_event("reason", text="thinking")
+            yield _make_event("reason", text="thinking",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta")
             raise MiraAuthError("token expired mid-stream")
 
         bridge._sessions["t1"] = "s1"

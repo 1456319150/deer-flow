@@ -34,6 +34,9 @@ class TestDataModels:
         assert evt.text == ""
         assert evt.message_id == ""
         assert evt.session_id == ""
+        assert evt.block_type == ""
+        assert evt.delta_type == ""
+        assert evt.inner_type == ""
 
     def test_mira_event_full(self):
         evt = MiraEvent(
@@ -42,6 +45,29 @@ class TestDataModels:
         )
         assert evt.event == "content"
         assert evt.text == "hi"
+
+    def test_mira_event_with_streaming_fields(self):
+        """MiraEvent carries block_type/delta_type/inner_type for nested Claude events."""
+        evt = MiraEvent(
+            event="reason", data={}, text="thinking...",
+            block_type="thinking",
+            delta_type="thinking_delta",
+            inner_type="content_block_delta",
+        )
+        assert evt.block_type == "thinking"
+        assert evt.delta_type == "thinking_delta"
+        assert evt.inner_type == "content_block_delta"
+
+    def test_mira_event_text_block_fields(self):
+        """MiraEvent for a text (answer) delta."""
+        evt = MiraEvent(
+            event="reason", data={}, text="answer chunk",
+            block_type="text",
+            delta_type="text_delta",
+            inner_type="content_block_delta",
+        )
+        assert evt.block_type == "text"
+        assert evt.delta_type == "text_delta"
 
     def test_mira_message(self):
         msg = MiraMessage(
@@ -199,11 +225,14 @@ class TestParseEvent:
         assert evt.message_id == ""
 
     def test_parse_reason_with_nested_delta(self):
-        """Reason event with thinking text in data.event.delta.text"""
+        """Reason event with thinking text in data.event.delta.thinking"""
         msg = {
             "event": "reason",
             "data": {
-                "event": {"delta": {"text": "thinking step"}},
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": "thinking step"},
+                },
                 "parent_tool_use_id": "",
                 "session_id": "s1",
                 "type": "content_block_delta",
@@ -212,6 +241,107 @@ class TestParseEvent:
         }
         evt = MiraClient._parse_event(msg)
         assert evt.text == "thinking step"
+        assert evt.inner_type == "content_block_delta"
+        assert evt.delta_type == "thinking_delta"
+
+    def test_parse_reason_content_block_start_thinking(self):
+        """Reason event with content_block_start for thinking block."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {"type": "thinking"},
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.inner_type == "content_block_start"
+        assert evt.block_type == "thinking"
+
+    def test_parse_reason_content_block_start_text(self):
+        """Reason event with content_block_start for text block."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {"type": "text"},
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.inner_type == "content_block_start"
+        assert evt.block_type == "text"
+
+    def test_parse_reason_content_block_stop(self):
+        """Reason event with content_block_stop."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "event": {"type": "content_block_stop"},
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.inner_type == "content_block_stop"
+        assert evt.block_type == ""
+        assert evt.delta_type == ""
+
+    def test_parse_reason_text_delta(self):
+        """Reason event with text_delta (answer text)."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "answer chunk"},
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.text == "answer chunk"
+        assert evt.delta_type == "text_delta"
+        assert evt.inner_type == "content_block_delta"
+
+    def test_parse_reason_thinking_delta(self):
+        """Reason event with thinking_delta."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": "let me think"},
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.text == "let me think"
+        assert evt.delta_type == "thinking_delta"
+
+    def test_parse_reason_message_start(self):
+        """Reason event with message_start inner type."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "event": {"type": "message_start"},
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.inner_type == "message_start"
+        assert evt.text == ""
+
+    def test_parse_reason_fallback_message_content(self):
+        """Reason event falls back to message.content[0].text."""
+        msg = {
+            "event": "reason",
+            "data": {
+                "message": {
+                    "content": [{"text": "fallback text"}],
+                },
+            },
+        }
+        evt = MiraClient._parse_event(msg)
+        assert evt.text == "fallback text"
 
     def test_parse_content_fallback_top_level_result(self):
         """Content event with result at top level (fallback format)"""

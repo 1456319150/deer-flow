@@ -149,6 +149,16 @@ class FeishuBot:
         tool_cards: dict[str, dict[str, str | None]] = {}
         saw_stream_event = False
 
+        # Streaming card state: create card on first delta, update on subsequent
+        _thinking_card_id: str | None = None
+        _thinking_acc: list[str] = []
+        _result_card_id: str | None = None
+        _result_acc: list[str] = []
+        _STREAM_THROTTLE = 0.3  # min seconds between card updates
+        import time as _time
+        _last_thinking_update = 0.0
+        _last_result_update = 0.0
+
         try:
             async for event in self.bridge.stream_ask(topic_id, text):
                 if event["type"] == "stream_event":
@@ -161,6 +171,40 @@ class FeishuBot:
                         len(stream_event.text),
                         _preview_text(stream_event.text),
                     )
+                    # ── Streaming delta handling (Mira bridge) ─────
+                    if stream_event.kind == "thinking" and stream_event.text:
+                        _thinking_acc.append(stream_event.text)
+                        now = _time.monotonic()
+                        if now - _last_thinking_update >= _STREAM_THROTTLE:
+                            full = "".join(_thinking_acc)
+                            block = "💭 **Thinking...**\n\n" + full
+                            if _thinking_card_id:
+                                try:
+                                    await self._update_card(_thinking_card_id, block)
+                                except Exception:
+                                    log.debug("update thinking card failed, creating new")
+                                    _thinking_card_id = await self._reply_card(msg_id, block)
+                            else:
+                                _thinking_card_id = await self._reply_card(msg_id, block)
+                            _last_thinking_update = now
+                        continue
+
+                    if stream_event.kind == "result" and stream_event.text:
+                        _result_acc.append(stream_event.text)
+                        now = _time.monotonic()
+                        if now - _last_result_update >= _STREAM_THROTTLE:
+                            full = "".join(_result_acc)
+                            if _result_card_id:
+                                try:
+                                    await self._update_card(_result_card_id, full)
+                                except Exception:
+                                    log.debug("update result card failed, creating new")
+                                    _result_card_id = await self._reply_card(msg_id, full)
+                            else:
+                                _result_card_id = await self._reply_card(msg_id, full)
+                            _last_result_update = now
+                        continue
+
                     if stream_event.kind == "text":
                         streamed_texts.append(stream_event.text)
                     if stream_event.kind == "result":
@@ -237,6 +281,26 @@ class FeishuBot:
         except Exception as e:
             log.exception("Bridge error")
             result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
+
+        # ── Final flush for streaming cards ────────────────────
+        if _thinking_acc:
+            full = "".join(_thinking_acc)
+            block = "💭 **Thinking**\n\n" + full
+            if _thinking_card_id:
+                try:
+                    await self._update_card(_thinking_card_id, block)
+                except Exception:
+                    pass
+            elif saw_stream_event:
+                await self._reply_card(msg_id, block)
+
+        if _result_acc:
+            full = "".join(_result_acc)
+            if _result_card_id:
+                try:
+                    await self._update_card(_result_card_id, full)
+                except Exception:
+                    pass
 
         if not saw_stream_event:
             card_content = self._format_result(result)

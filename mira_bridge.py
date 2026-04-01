@@ -110,43 +110,63 @@ class MiraBridge:
 
         result = StreamResult()
         result.session_id = session_id
-        thinking_buffer: list[str] = []
+
+        # ── Streaming state ────────────────────────────────────────
+        # Track current content block type from content_block_start
+        current_block: str = ""           # "thinking" | "text" | ""
+        thinking_chunks: list[str] = []   # accumulated thinking text
+        result_chunks: list[str] = []     # accumulated answer text
 
         try:
             async for evt in self.client.chat(
                 session_id, prompt, model=self.model, mode=self.mode
             ):
-                # ── Thinking (reason) — buffer, emit once ──────────
-                if evt.event == "reason" and evt.text:
-                    thinking_buffer.append(evt.text)
+                if evt.event != "reason":
+                    # ── content event: extract usage (text already streamed) ─
+                    if evt.event == "content":
+                        inner = evt.data.get("content", {}) if isinstance(evt.data, dict) else {}
+                        if isinstance(inner, dict):
+                            result.usage = self._extract_usage(inner)
+                            # If we got no stream deltas, fall back to content.result
+                            if not result_chunks and inner.get("result"):
+                                result.result_text = inner["result"]
+                                yield {
+                                    "type": "stream_event",
+                                    "event": StreamEvent(kind="result", text=result.result_text),
+                                }
+                    elif evt.event == "title" and evt.text:
+                        log.info("[MiraBridge] session title: %s", evt.text)
+                    continue
 
-                # ── Thinking→Content transition ────────────────────
-                elif evt.event == "start_content":
-                    if thinking_buffer:
-                        full_thinking = "".join(thinking_buffer)
-                        result.thinking = [full_thinking]
-                        yield {
-                            "type": "stream_event",
-                            "event": StreamEvent(
-                                kind="thinking", text=full_thinking
-                            ),
-                        }
+                # ── reason event: streaming deltas ─────────────────
+                # Block type transitions (content_block_start)
+                if evt.inner_type == "content_block_start" and evt.block_type:
+                    current_block = evt.block_type
+                    log.debug("[MiraBridge] block start: %s", current_block)
+                    continue
 
-                # ── Final answer ───────────────────────────────────
-                elif evt.event == "content" and evt.text:
-                    result.result_text = evt.text
-                    # Extract usage from inner content dict (data.content)
-                    inner = evt.data.get("content", {}) if isinstance(evt.data, dict) else {}
-                    if isinstance(inner, dict):
-                        result.usage = self._extract_usage(inner)
+                if evt.inner_type == "content_block_stop":
+                    current_block = ""
+                    continue
+
+                # Only process events with text deltas
+                if not evt.text:
+                    continue
+
+                # Determine kind based on current block or delta type
+                if current_block == "thinking" or evt.delta_type == "thinking_delta":
+                    thinking_chunks.append(evt.text)
+                    yield {
+                        "type": "stream_event",
+                        "event": StreamEvent(kind="thinking", text=evt.text),
+                    }
+                else:
+                    # text block or unclassified → treat as answer
+                    result_chunks.append(evt.text)
                     yield {
                         "type": "stream_event",
                         "event": StreamEvent(kind="result", text=evt.text),
                     }
-
-                # ── Session title (log only) ───────────────────────
-                elif evt.event == "title" and evt.text:
-                    log.info("[MiraBridge] session title: %s", evt.text)
 
         except MiraAuthError as e:
             result.assistant_texts.append(
@@ -156,14 +176,11 @@ class MiraBridge:
             log.exception("[MiraBridge] stream error")
             result.assistant_texts.append(f"\u274c Mira error: {e}")
 
-        # Edge case: thinking accumulated but no start_content event
-        if thinking_buffer and not result.thinking:
-            full_thinking = "".join(thinking_buffer)
-            result.thinking = [full_thinking]
-            yield {
-                "type": "stream_event",
-                "event": StreamEvent(kind="thinking", text=full_thinking),
-            }
+        # Build final result from accumulated chunks
+        if thinking_chunks:
+            result.thinking = ["".join(thinking_chunks)]
+        if result_chunks:
+            result.result_text = "".join(result_chunks)
 
         result.stop_reason = "end_turn"
         yield {"type": "final", "result": result}
