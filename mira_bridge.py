@@ -134,9 +134,10 @@ class MiraBridge:
                 # ── Final answer ───────────────────────────────────
                 elif evt.event == "content" and evt.text:
                     result.result_text = evt.text
-                    # Extract usage stats from content event data
-                    if isinstance(evt.data, dict):
-                        result.usage = self._extract_usage(evt.data)
+                    # Extract usage from inner content dict (data.content)
+                    inner = evt.data.get("content", {}) if isinstance(evt.data, dict) else {}
+                    if isinstance(inner, dict):
+                        result.usage = self._extract_usage(inner)
                     yield {
                         "type": "stream_event",
                         "event": StreamEvent(kind="result", text=evt.text),

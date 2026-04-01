@@ -332,19 +332,58 @@ class MiraClient:
                 raw_data = {"raw": raw_data}
 
         text = ""
-        if event_type == "reason" and isinstance(raw_data, dict):
-            text = raw_data.get("text", "")
-        elif event_type == "content" and isinstance(raw_data, dict):
-            text = raw_data.get("result", "")
-        elif event_type == "title" and isinstance(raw_data, dict):
-            text = raw_data.get("title", raw_data.get("text", ""))
+        message_id = ""
+        session_id = ""
+
+        if isinstance(raw_data, dict):
+            if event_type == "reason":
+                # Thinking text may be at: data.text, data.message.content[0].text,
+                # or data.event.delta.text (Claude-style nested events)
+                text = raw_data.get("text", "")
+                if not text:
+                    evt_inner = raw_data.get("event", {})
+                    if isinstance(evt_inner, dict):
+                        text = evt_inner.get("delta", {}).get("text", "")
+                if not text:
+                    msg_inner = raw_data.get("message", {})
+                    if isinstance(msg_inner, dict):
+                        blocks = msg_inner.get("content", [])
+                        if isinstance(blocks, list) and blocks:
+                            text = blocks[0].get("text", "") if isinstance(blocks[0], dict) else ""
+
+            elif event_type == "content":
+                # Response text at: data.content.result (actual API)
+                # or data.result (fallback for alternative formats)
+                inner = raw_data.get("content", {})
+                if isinstance(inner, dict) and inner:
+                    text = inner.get("result", "")
+                    session_id = str(inner.get("session_id", ""))
+                if not text:
+                    text = raw_data.get("result", "")
+
+            elif event_type == "title":
+                # Title at: data.content (actual API) or data.title (fallback)
+                text = raw_data.get("content", raw_data.get("title", raw_data.get("text", "")))
+
+            elif event_type == "start":
+                me = raw_data.get("message_entity", {})
+                if isinstance(me, dict):
+                    message_id = str(me.get("messageId", ""))
+                    session_id = str(me.get("sessionId", ""))
+                message_id = message_id or str(raw_data.get("message_id", ""))
+
+            # Fallback ID extraction
+            if not message_id:
+                message_id = str(raw_data.get("messageId", raw_data.get("message_id", "")))
+            if not session_id:
+                session_id = str(raw_data.get("sessionId", raw_data.get("session_id", "")))
 
         return MiraEvent(
             event=event_type,
             data=raw_data if isinstance(raw_data, dict) else {"raw": raw_data},
             text=text,
-            message_id=str(raw_data.get("messageId", "")) if isinstance(raw_data, dict) else "",
-            session_id=str(raw_data.get("sessionId", "")) if isinstance(raw_data, dict) else "",
+            message_id=message_id,
+            session_id=session_id,
         )
 
     @staticmethod
