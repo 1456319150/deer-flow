@@ -2,8 +2,8 @@
 
 All Mira network calls are mocked. Tests validate:
 - Event mapping (reason deltas → immediate thinking/result stream events)
-- data_type filtering (assistant/system skipped, user → tool_result)
-- Tool use events surfaced as tool_use StreamEvents
+- data_type filtering (assistant/system/user skipped — internal tool calls hidden)
+- Tool use events silently logged (not surfaced to user)
 - input_json_delta skipped (not display text)
 - Session persistence (load/save/reset)
 - Error handling (auth, generic)
@@ -456,11 +456,19 @@ class TestStreamAskEventMapping:
         for e in stream_events:
             assert "recognizer_results" not in e["event"].text
     @pytest.mark.asyncio
-    async def test_user_type_yields_tool_result(self, bridge):
-        """User-type reason events yield tool_result StreamEvents."""
+    async def test_user_type_silently_skipped(self, bridge):
+        """User-type reason events (internal tool results) are silently skipped."""
         async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("reason", text="Search results: 3 items found",
                               data_type="user")
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="answer",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
             yield _make_event("content", data={"content": {"result": "answer"}})
 
         bridge._sessions["t1"] = "existing_session"
@@ -468,13 +476,16 @@ class TestStreamAskEventMapping:
             events = await _collect_events(bridge.stream_ask("t1", "question"))
 
         stream_events = [e for e in events if e["type"] == "stream_event"]
+        # No tool_result events should appear — internal tool results are hidden
         tool_result_events = [e for e in stream_events if e["event"].kind == "tool_result"]
-        assert len(tool_result_events) == 1
-        assert "Search results" in tool_result_events[0]["event"].text
+        assert len(tool_result_events) == 0
+        # Only the text delta should appear
+        result_events = [e for e in stream_events if e["event"].kind == "result"]
+        assert len(result_events) == 1
 
     @pytest.mark.asyncio
-    async def test_user_type_empty_text_fallback(self, bridge):
-        """User-type reason events with no text get fallback text."""
+    async def test_user_type_empty_text_silently_skipped(self, bridge):
+        """User-type reason events with no text are silently skipped."""
         async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("reason", text="", data_type="user")
             yield _make_event("content", data={"content": {"result": "answer"}})
@@ -483,18 +494,15 @@ class TestStreamAskEventMapping:
         with patch.object(bridge.client, "chat", side_effect=mock_chat):
             events = await _collect_events(bridge.stream_ask("t1", "question"))
 
-        tool_result_events = [
-            e for e in events
-            if e["type"] == "stream_event" and e["event"].kind == "tool_result"
-        ]
-        assert len(tool_result_events) == 1
-        assert tool_result_events[0]["event"].text == "(tool executed)"
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        tool_result_events = [e for e in stream_events if e["event"].kind == "tool_result"]
+        assert len(tool_result_events) == 0
 
     # ── NEW: tool_use event tests ──────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_tool_use_block_yields_tool_use_event(self, bridge):
-        """content_block_start with tool_use yields a tool_use StreamEvent."""
+    async def test_tool_use_block_silently_logged(self, bridge):
+        """content_block_start with tool_use is silently logged, not surfaced."""
         async def mock_chat(session_id, content, model=None, mode=None):
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="tool_use", data_type="stream_event",
@@ -514,10 +522,8 @@ class TestStreamAskEventMapping:
 
         stream_events = [e for e in events if e["type"] == "stream_event"]
         tool_use_events = [e for e in stream_events if e["event"].kind == "tool_use"]
-        assert len(tool_use_events) == 1
-        assert tool_use_events[0]["event"].tool_name == "web_search"
-        assert tool_use_events[0]["event"].tool_use_id == "toolu_123"
-        assert tool_use_events[0]["event"].text == "web_search"
+        # Tool use events should NOT be surfaced to user
+        assert len(tool_use_events) == 0
 
     @pytest.mark.asyncio
     async def test_input_json_delta_skipped(self, bridge):
@@ -555,7 +561,7 @@ class TestStreamAskEventMapping:
 
     @pytest.mark.asyncio
     async def test_full_tool_use_flow(self, bridge):
-        """Full flow: thinking → tool_use → tool_result → text answer."""
+        """Full flow: thinking → tool_use (hidden) → tool_result (hidden) → text answer."""
         async def mock_chat(session_id, content, model=None, mode=None):
             # Thinking
             yield _make_event("reason", inner_type="content_block_start",
@@ -608,9 +614,10 @@ class TestStreamAskEventMapping:
         kinds = [e["event"].kind for e in stream_events]
 
         assert "thinking" in kinds
-        assert "tool_use" in kinds
-        assert "tool_result" in kinds
         assert "result" in kinds
+        # Internal tool calls should NOT be surfaced
+        assert "tool_use" not in kinds
+        assert "tool_result" not in kinds
 
         # Verify no duplicate text from assistant summaries
         result_events = [e for e in stream_events if e["event"].kind == "result"]

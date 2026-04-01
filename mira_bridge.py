@@ -9,7 +9,7 @@ Key design decisions:
     - Reason events are classified by data.type:
         * stream_event — actual Claude streaming deltas (process these)
         * assistant — full accumulated snapshot (skip to avoid duplicates)
-        * user — tool result injected back (surface as tool_result event)
+        * user — tool result injected back (internal, not surfaced)
         * system — metadata (skip)
     - Content event maps to a single "result" StreamEvent (fallback).
 """
@@ -152,16 +152,10 @@ class MiraBridge:
                     )
                     continue
 
-                # Handle user events (tool results injected back)
+                # Skip user events (internal tool results — not for display)
                 if evt.data_type == "user":
-                    tool_result_text = evt.text or "(tool executed)"
-                    yield {
-                        "type": "stream_event",
-                        "event": StreamEvent(
-                            kind="tool_result",
-                            text=tool_result_text[:500],
-                        ),
-                    }
+                    log.debug("[MiraBridge] tool result (internal): %s",
+                              evt.text[:100] if evt.text else "")
                     continue
 
                 # ── stream_event or untyped reason: streaming deltas ─
@@ -171,17 +165,10 @@ class MiraBridge:
                     current_block = evt.block_type
                     log.debug("[MiraBridge] block start: %s", current_block)
 
-                    # Surface tool_use blocks so feishu_bot can render cards
-                    if evt.block_type == "tool_use" and evt.tool_name:
-                        yield {
-                            "type": "stream_event",
-                            "event": StreamEvent(
-                                kind="tool_use",
-                                text=evt.tool_name,
-                                tool_name=evt.tool_name,
-                                tool_use_id=evt.tool_use_id,
-                            ),
-                        }
+                    # Log tool_use blocks silently (internal Mira tool calls)
+                    if evt.block_type == "tool_use":
+                        log.info("[MiraBridge] tool call: %s",
+                                 evt.tool_name or "unknown")
                     continue
 
                 if evt.inner_type == "content_block_stop":
