@@ -2,7 +2,7 @@
 # Env vars: FEISHU_APP_ID, FEISHU_APP_SECRET
 
 # Provider selection: "claude" (default) or "mira"
-provider: claude
+provider: mira
 
 feishu:
   app_id: ${FEISHU_APP_ID}
