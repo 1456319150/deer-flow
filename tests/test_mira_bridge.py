@@ -927,3 +927,259 @@ class TestAsk:
 
         assert result.result_text == "the answer"
         assert result.stop_reason == "end_turn"
+
+
+# ── Tests for assistant snapshot tool extraction ────────────────────
+
+
+def _make_assistant_snapshot_with_tools(tool_uses: list[dict]) -> MiraEvent:
+    """Create an assistant-type reason event with tool_use blocks in message.content."""
+    content_blocks = []
+    for tu in tool_uses:
+        content_blocks.append({
+            "type": "tool_use",
+            "id": tu.get("id", ""),
+            "name": tu.get("name", ""),
+            "input": tu.get("input", {}),
+        })
+    data = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": content_blocks,
+        },
+    }
+    return MiraEvent(
+        event="reason",
+        data=data,
+        text="",
+        data_type="assistant",
+    )
+
+
+class TestExtractAssistantToolUses:
+    """Tests for _extract_assistant_tool_uses — extracting tool names
+    and emitting tool_use events from assistant message snapshots."""
+
+    def test_records_tool_name_mapping(self):
+        """Assistant snapshot should record tool_use_id → tool_name."""
+        from mira_bridge import MiraBridge
+        evt = _make_assistant_snapshot_with_tools([
+            {"id": "toolu_abc", "name": "web_search", "input": {"query": "hello"}},
+        ])
+        tool_names: dict[str, str] = {}
+        emitted: set[str] = set()
+        MiraBridge._extract_assistant_tool_uses(evt, tool_names, emitted)
+        assert tool_names == {"toolu_abc": "web_search"}
+
+    def test_emits_tool_use_event_for_new_tool(self):
+        """If tool_use was NOT already emitted via content_block_stop, emit it."""
+        from mira_bridge import MiraBridge
+        evt = _make_assistant_snapshot_with_tools([
+            {"id": "toolu_abc", "name": "web_search", "input": {"query": "hello"}},
+        ])
+        tool_names: dict[str, str] = {}
+        emitted: set[str] = set()
+        events = MiraBridge._extract_assistant_tool_uses(evt, tool_names, emitted)
+        assert len(events) == 1
+        assert events[0]["event"].kind == "tool_use"
+        assert events[0]["event"].tool_name == "web_search"
+        assert events[0]["event"].tool_use_id == "toolu_abc"
+        assert events[0]["event"].text == "hello"  # query extracted
+        assert "toolu_abc" in emitted
+
+    def test_skips_already_emitted_tool(self):
+        """If tool was already emitted via content_block_stop, do not duplicate."""
+        from mira_bridge import MiraBridge
+        evt = _make_assistant_snapshot_with_tools([
+            {"id": "toolu_abc", "name": "web_search", "input": {"query": "hello"}},
+        ])
+        tool_names: dict[str, str] = {}
+        emitted: set[str] = {"toolu_abc"}  # Already emitted
+        events = MiraBridge._extract_assistant_tool_uses(evt, tool_names, emitted)
+        assert len(events) == 0
+        # But name mapping should still be recorded
+        assert tool_names == {"toolu_abc": "web_search"}
+
+    def test_multiple_tools_in_one_snapshot(self):
+        """Multiple tool_use blocks in one assistant snapshot."""
+        from mira_bridge import MiraBridge
+        evt = _make_assistant_snapshot_with_tools([
+            {"id": "toolu_1", "name": "search", "input": {"query": "q1"}},
+            {"id": "toolu_2", "name": "fetch", "input": {"url": "https://example.com"}},
+        ])
+        tool_names: dict[str, str] = {}
+        emitted: set[str] = set()
+        events = MiraBridge._extract_assistant_tool_uses(evt, tool_names, emitted)
+        assert len(events) == 2
+        assert tool_names == {"toolu_1": "search", "toolu_2": "fetch"}
+        assert events[0]["event"].tool_name == "search"
+        assert events[1]["event"].tool_name == "fetch"
+        assert events[1]["event"].text == "https://example.com"  # url extracted
+
+    def test_no_message_content(self):
+        """Assistant event with no message.content returns nothing."""
+        from mira_bridge import MiraBridge
+        evt = _make_event("reason", text="summary text", data_type="assistant")
+        tool_names: dict[str, str] = {}
+        emitted: set[str] = set()
+        events = MiraBridge._extract_assistant_tool_uses(evt, tool_names, emitted)
+        assert events == []
+        assert tool_names == {}
+
+    def test_mixed_content_blocks(self):
+        """Assistant snapshot with text + tool_use — only tool_use extracted."""
+        from mira_bridge import MiraBridge
+        data = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "I will search for..."},
+                    {"type": "tool_use", "id": "toolu_x", "name": "search", "input": {"query": "test"}},
+                ],
+            },
+        }
+        evt = MiraEvent(event="reason", data=data, text="", data_type="assistant")
+        tool_names: dict[str, str] = {}
+        emitted: set[str] = set()
+        events = MiraBridge._extract_assistant_tool_uses(evt, tool_names, emitted)
+        assert len(events) == 1
+        assert events[0]["event"].tool_name == "search"
+
+
+class TestAssistantSnapshotIntegration:
+    """Integration tests: tool_use from assistant snapshot + tool_result from user."""
+
+    @pytest.fixture
+    def bridge(self, tmp_path):
+        cfg = {
+            "session_token": "test-token",
+            "base_url": "https://mira.test.net",
+            "session_store_path": str(tmp_path / "s.json"),
+        }
+        from mira_bridge import MiraBridge
+        return MiraBridge(cfg)
+
+    @pytest.mark.asyncio
+    async def test_tool_result_resolves_name_from_assistant_snapshot(self, bridge):
+        """When tool_use only appears in assistant snapshot (no content_block_start),
+        tool_result should still resolve the correct tool name."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            # No content_block_start for tool_use — only assistant snapshot
+            yield _make_assistant_snapshot_with_tools([
+                {"id": "toolu_bdrk_abc", "name": "mcp__proxy___mira_py__web_search",
+                 "input": {"query": "千岛湖酒店"}},
+            ])
+            # Tool result
+            yield _make_user_event_with_tool_result(
+                tool_use_id="toolu_bdrk_abc",
+                content="Found 5 hotels near Qiandao Lake",
+            )
+            yield _make_event("content", data={"content": {"result": "answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "query"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        tool_use = [e for e in stream_events if e["event"].kind == "tool_use"]
+        tool_result = [e for e in stream_events if e["event"].kind == "tool_result"]
+
+        # tool_use emitted from assistant snapshot
+        assert len(tool_use) == 1
+        assert tool_use[0]["event"].tool_name == "mcp__proxy___mira_py__web_search"
+        assert tool_use[0]["event"].tool_use_id == "toolu_bdrk_abc"
+
+        # tool_result resolves name via assistant snapshot mapping
+        assert len(tool_result) == 1
+        assert tool_result[0]["event"].tool_name == "mcp__proxy___mira_py__web_search"
+        assert tool_result[0]["event"].text == "Found 5 hotels near Qiandao Lake"
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_when_content_block_and_assistant_both_present(self, bridge):
+        """If content_block_stop already emitted tool_use, assistant snapshot
+        should NOT emit a duplicate."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            # Normal content_block_start → stop flow
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="tool_use", data_type="stream_event",
+                              tool_name="web_search", tool_use_id="toolu_789")
+            yield _make_event("reason", inner_type="content_block_delta",
+                              delta_type="input_json_delta",
+                              data_type="stream_event",
+                              data={"event": {"delta": {"partial_json": '{"query":"test"}'}}})
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Assistant snapshot (same tool — should NOT produce duplicate)
+            yield _make_assistant_snapshot_with_tools([
+                {"id": "toolu_789", "name": "web_search", "input": {"query": "test"}},
+            ])
+            yield _make_user_event_with_tool_result("toolu_789", "result text")
+            yield _make_event("content", data={"content": {"result": "answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "query"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        tool_use = [e for e in stream_events if e["event"].kind == "tool_use"]
+        # Only 1, not 2
+        assert len(tool_use) == 1
+        assert tool_use[0]["event"].tool_name == "web_search"
+
+    @pytest.mark.asyncio
+    async def test_multiple_tools_only_in_assistant_snapshots(self, bridge):
+        """Simulates the user's actual failure: multiple tools only visible
+        in assistant snapshots, not via content_block_start/stop."""
+        async def mock_chat(session_id, content, model=None, mode=None):
+            # Thinking delta
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="thinking", data_type="stream_event")
+            yield _make_event("reason", text="Planning trip...",
+                              inner_type="content_block_delta",
+                              delta_type="thinking_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            # Assistant snapshot with multiple tool calls
+            yield _make_assistant_snapshot_with_tools([
+                {"id": "toolu_bdrk_01", "name": "mcp__proxy___mira_py__web_search",
+                 "input": {"query": "千岛湖汉庭酒店"}},
+                {"id": "toolu_bdrk_02", "name": "mcp__proxy___mira__web_builtin_fetch",
+                 "input": {"data": {"url": "https://example.com"}}},
+            ])
+            # Tool results
+            yield _make_user_event_with_tool_result("toolu_bdrk_01", "汉庭酒店价格信息")
+            yield _make_user_event_with_tool_result("toolu_bdrk_02", "网页内容")
+            # Final answer
+            yield _make_event("reason", inner_type="content_block_start",
+                              block_type="text", data_type="stream_event")
+            yield _make_event("reason", text="Here is the answer",
+                              inner_type="content_block_delta",
+                              delta_type="text_delta",
+                              data_type="stream_event")
+            yield _make_event("reason", inner_type="content_block_stop",
+                              data_type="stream_event")
+            yield _make_event("content", data={"content": {"result": "Here is the answer"}})
+
+        bridge._sessions["t1"] = "existing_session"
+        with patch.object(bridge.client, "chat", side_effect=mock_chat):
+            events = await _collect_events(bridge.stream_ask("t1", "query"))
+
+        stream_events = [e for e in events if e["type"] == "stream_event"]
+        kinds = [e["event"].kind for e in stream_events]
+
+        # Correct order: thinking → tool_use → tool_use → tool_result → tool_result → result
+        assert kinds[0] == "thinking"
+        tool_use = [e for e in stream_events if e["event"].kind == "tool_use"]
+        tool_result = [e for e in stream_events if e["event"].kind == "tool_result"]
+
+        assert len(tool_use) == 2
+        assert tool_use[0]["event"].tool_name == "mcp__proxy___mira_py__web_search"
+        assert tool_use[1]["event"].tool_name == "mcp__proxy___mira__web_builtin_fetch"
+        assert tool_use[1]["event"].text == "https://example.com"  # URL extracted from nested data
+
+        assert len(tool_result) == 2
+        # Names resolved via assistant snapshot mapping
+        assert tool_result[0]["event"].tool_name == "mcp__proxy___mira_py__web_search"
+        assert tool_result[1]["event"].tool_name == "mcp__proxy___mira__web_builtin_fetch"

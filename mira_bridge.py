@@ -8,14 +8,17 @@ Key design decisions:
       sessionId per topic_id (no need to replay message history).
     - Reason events are classified by data.type:
         * stream_event — actual Claude streaming deltas (process these)
-        * assistant — full accumulated snapshot (skip to avoid duplicates)
+        * assistant — full accumulated snapshot; extract tool_use_id → name
+          mapping (fallback) and emit any tool_use blocks not seen via deltas
         * user — tool results → surfaced as tool_result events
         * system — metadata (skip)
     - Tool call lifecycle:
         1. content_block_start (block_type=tool_use) → record name/id
         2. input_json_delta events → accumulate partial JSON
         3. content_block_stop → yield StreamEvent(kind="tool_use")
-        4. user event with tool_result blocks → yield StreamEvent(kind="tool_result")
+        4. assistant message snapshot → fallback: extract tool names and
+           emit tool_use events for any tools not captured via deltas
+        5. user event with tool_result blocks → yield StreamEvent(kind="tool_result")
     - Content event maps to a single "result" StreamEvent (fallback).
 """
 from __future__ import annotations
@@ -130,6 +133,8 @@ class MiraBridge:
         _cur_tool_input_chunks: list[str] = []
         # Map tool_use_id → tool_name for correlating tool_result events
         _tool_names: dict[str, str] = {}
+        # Track which tool_use_ids we've already emitted via content_block_stop
+        _emitted_tool_ids: set[str] = set()
 
         try:
             async for evt in self.client.chat(
@@ -154,12 +159,24 @@ class MiraBridge:
 
                 # ── reason event: classify by data_type ────────────
 
-                # Skip assistant summaries and system/safety metadata
-                if evt.data_type in ("assistant", "system", "safety_audit"):
+                # Skip system metadata and safety audit events
+                if evt.data_type in ("system", "safety_audit"):
                     log.debug(
-                        "[MiraBridge] skip %s reason (not a delta)",
+                        "[MiraBridge] skip %s reason (metadata)",
                         evt.data_type,
                     )
+                    continue
+
+                # ── assistant snapshots: extract tool_use_id→name mapping ──
+                # The frontend uses assistant messages as a fallback source
+                # for tool names (recordToolName in parseStreamingEvents).
+                # We do the same: extract tool names, and emit tool_use events
+                # for any tools not already captured via content_block_stop.
+                if evt.data_type == "assistant":
+                    for tool_evt in self._extract_assistant_tool_uses(
+                        evt, _tool_names, _emitted_tool_ids
+                    ):
+                        yield tool_evt
                     continue
 
                 # ── user events: tool results ──────────────────────
@@ -201,6 +218,7 @@ class MiraBridge:
                             "[MiraBridge] tool_use complete: name=%s id=%s input_len=%d",
                             _cur_tool_name, _cur_tool_use_id, len(tool_input),
                         )
+                        _emitted_tool_ids.add(_cur_tool_use_id)
                         yield {
                             "type": "stream_event",
                             "event": StreamEvent(
@@ -262,6 +280,86 @@ class MiraBridge:
         yield {"type": "final", "result": result}
 
     # ── Tool event helpers ─────────────────────────────────────────
+
+    @staticmethod
+    def _extract_assistant_tool_uses(
+        evt: Any,
+        tool_names: dict[str, str],
+        emitted_tool_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Extract tool_use_id→name mappings from assistant message snapshots.
+
+        The frontend (parseStreamingEvents) uses assistant messages as a
+        fallback source for tool names via recordToolName(). We replicate
+        this: for every tool_use block in the assistant snapshot, record
+        the name mapping. If a tool_use was NOT already emitted via
+        content_block_stop, emit it now as a tool_use event.
+
+        This handles cases where:
+        - content_block_start didn't carry the tool name
+        - The entire tool_use lifecycle was delivered only as an assistant
+          snapshot (no individual content_block_start/delta/stop events)
+        """
+        events: list[dict[str, Any]] = []
+        msg = evt.data.get("message", {}) if isinstance(evt.data, dict) else {}
+        if not isinstance(msg, dict):
+            return events
+
+        blocks = msg.get("content", [])
+        if not isinstance(blocks, list):
+            return events
+
+        for blk in blocks:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") != "tool_use":
+                continue
+
+            tool_id = blk.get("id", "")
+            tool_name = blk.get("name", "")
+
+            # Always record the name mapping (primary purpose)
+            if tool_id and tool_name:
+                tool_names[tool_id] = tool_name
+
+            # If this tool_use wasn't emitted via content_block_stop,
+            # emit it now from the assistant snapshot
+            if tool_id and tool_id not in emitted_tool_ids:
+                emitted_tool_ids.add(tool_id)
+                # Format the input for display
+                tool_input = blk.get("input", {})
+                if isinstance(tool_input, dict):
+                    try:
+                        raw_json = json.dumps(tool_input, ensure_ascii=False)
+                        display = MiraBridge._format_tool_input(raw_json, tool_name)
+                    except (TypeError, ValueError):
+                        display = str(tool_input)[:500]
+                elif isinstance(tool_input, str):
+                    display = tool_input[:500]
+                else:
+                    display = ""
+
+                log.info(
+                    "[MiraBridge] tool_use from assistant snapshot: name=%s id=%s",
+                    tool_name, tool_id,
+                )
+                events.append({
+                    "type": "stream_event",
+                    "event": StreamEvent(
+                        kind="tool_use",
+                        text=display,
+                        tool_name=tool_name,
+                        tool_use_id=tool_id,
+                    ),
+                })
+
+        if events:
+            log.info(
+                "[MiraBridge] assistant snapshot: recorded %d tool names, emitted %d new tool_use events",
+                len([b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]),
+                len(events),
+            )
+        return events
 
     @staticmethod
     def _parse_user_tool_results(
