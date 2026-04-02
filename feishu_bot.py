@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from typing import Any
@@ -666,8 +667,52 @@ class FeishuBot:
         except Exception:
             log.exception("Update card failed for %s (text_len=%d)", card_id, len(text))
 
+    # ── Regex patterns for card content sanitization ──────────────
+    # Markdown image: ![alt](url) or ![alt](url "title")
+    _RE_MD_IMAGE = re.compile(r'!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
+    # HTML img tag
+    _RE_HTML_IMG = re.compile(r'<img\b[^>]*src=["\x27]([^"\x27]+)["\x27][^>]*/?\s*>', re.IGNORECASE)
+    # Feishu image token pattern (used in Mira content)
+    _RE_FEISHU_IMAGE_TOKEN = re.compile(r'<image\s+token=["\x27]([^"\x27]+)["\x27][^/]*/?\s*>')
+
+    @classmethod
+    def _sanitize_for_card(cls, text: str) -> str:
+        """Sanitize markdown content for Feishu card compatibility.
+
+        Feishu interactive cards require uploaded image_keys for any image
+        content.  Raw image URLs / markdown images cause API error 11310.
+        This method converts image references to plain-text links.
+        """
+        if not text:
+            return text
+
+        # ![alt](url) -> [alt](url)  or  [image](url)
+        def _replace_md_img(m: re.Match) -> str:
+            alt = m.group(1).strip() or "image"
+            url = m.group(2)
+            return f"[{alt}]({url})"
+
+        text = cls._RE_MD_IMAGE.sub(_replace_md_img, text)
+
+        # <img src="url" ...> -> [image](url)
+        def _replace_html_img(m: re.Match) -> str:
+            url = m.group(1)
+            return f"[image]({url})"
+
+        text = cls._RE_HTML_IMG.sub(_replace_html_img, text)
+
+        # <image token="xxx" .../> (Feishu internal) -> [image:xxx]
+        def _replace_feishu_img(m: re.Match) -> str:
+            token = m.group(1)
+            return f"[image:{token}]"
+
+        text = cls._RE_FEISHU_IMAGE_TOKEN.sub(_replace_feishu_img, text)
+
+        return text
+
     @staticmethod
     def _card(text: str) -> str:
+        text = FeishuBot._sanitize_for_card(text)
         return json.dumps({
             "config": {"wide_screen_mode": True, "update_multi": True},
             "elements": [{"tag": "markdown", "content": text}],

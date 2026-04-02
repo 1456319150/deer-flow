@@ -203,3 +203,76 @@ class TestCardOrderingIntegration:
         final_process = process_cards[-1]
         assert "search" in final_process
         assert "fetch" in final_process
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Image / file sanitization for Feishu cards
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestSanitizeForCard:
+    """Test _sanitize_for_card strips images that would trigger Feishu error 11310."""
+
+    def test_markdown_image_converted(self):
+        text = "Result: ![chart](https://cdn.example.com/chart.png) done"
+        result = FeishuBot._sanitize_for_card(text)
+        assert "![" not in result
+        assert "[chart](https://cdn.example.com/chart.png)" in result
+        assert result.startswith("Result: ")
+        assert result.endswith(" done")
+
+    def test_markdown_image_with_title(self):
+        text = '![alt](https://x.com/a.jpg "My Title")'
+        result = FeishuBot._sanitize_for_card(text)
+        assert "![" not in result
+        assert "[alt](https://x.com/a.jpg)" in result
+
+    def test_markdown_image_empty_alt(self):
+        text = "![](https://example.com/img.png)"
+        result = FeishuBot._sanitize_for_card(text)
+        assert "![" not in result
+        assert "[image](https://example.com/img.png)" in result
+
+    def test_html_img_tag(self):
+        text = 'See: <img src="https://cdn.example.com/chart.png" width="400"> end'
+        result = FeishuBot._sanitize_for_card(text)
+        assert "<img" not in result
+        assert "[image](https://cdn.example.com/chart.png)" in result
+
+    def test_feishu_image_token(self):
+        text = 'Content <image token="boxcnABC123XYZ" /> more'
+        result = FeishuBot._sanitize_for_card(text)
+        assert "<image" not in result
+        assert "[image:boxcnABC123XYZ]" in result
+
+    def test_multiple_images_mixed(self):
+        text = "![a](url1.png) text <img src='url2.jpg'/> end"
+        result = FeishuBot._sanitize_for_card(text)
+        assert "![" not in result
+        assert "<img" not in result
+        assert "[a](url1.png)" in result
+        assert "[image](url2.jpg)" in result
+
+    def test_no_images_unchanged(self):
+        text = "Normal **bold** text with [link](https://example.com)"
+        result = FeishuBot._sanitize_for_card(text)
+        assert result == text
+
+    def test_empty_and_none(self):
+        assert FeishuBot._sanitize_for_card("") == ""
+        assert FeishuBot._sanitize_for_card(None) is None
+
+    def test_regular_link_not_affected(self):
+        """Ensure [text](url) links are NOT converted."""
+        text = "Click [here](https://example.com/page) for more"
+        result = FeishuBot._sanitize_for_card(text)
+        assert result == text
+
+    def test_card_integrates_sanitization(self):
+        """Verify _card() calls _sanitize_for_card."""
+        import json
+        card_json = FeishuBot._card("Hello ![img](https://x.com/a.png) world")
+        card = json.loads(card_json)
+        content = card["elements"][0]["content"]
+        assert "![" not in content
+        assert "[img](https://x.com/a.png)" in content
