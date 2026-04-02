@@ -141,7 +141,7 @@ class FeishuBot:
             log.exception("Error processing message")
 
     async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
-        """Full message lifecycle: react → stream cards → done."""
+        """Full message lifecycle: react -> stream cards -> done."""
         await self._react(msg_id, "OK")
         result = StreamResult()
         emitted_event_keys: set[tuple[str, str]] = set()
@@ -156,7 +156,7 @@ class FeishuBot:
         _result_acc: list[str] = []
         _thinking_dirty = False  # new content since last flush
         _result_dirty = False
-        _FLUSH_INTERVAL = 1.0  # seconds between card updates
+        _FLUSH_INTERVAL = 0.5  # seconds between card updates (was 1.0)
 
         async def _flush_cards():
             """Background flusher: periodically update cards with accumulated text."""
@@ -198,7 +198,7 @@ class FeishuBot:
                         len(stream_event.text),
                         _preview_text(stream_event.text),
                     )
-                    # ── Streaming delta handling (Mira bridge) ─────
+                    # -- Streaming delta handling (Mira bridge) --
                     if stream_event.kind == "thinking" and stream_event.text:
                         _thinking_acc.append(stream_event.text)
                         _thinking_dirty = True
@@ -286,14 +286,14 @@ class FeishuBot:
             log.exception("Bridge error")
             result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
 
-        # ── Cancel background flusher ──────────────────────────
+        # -- Cancel background flusher --
         flush_task.cancel()
         try:
             await flush_task
         except asyncio.CancelledError:
             pass
 
-        # ── Final flush — ensure all accumulated content is displayed ──
+        # -- Final flush -- ensure all accumulated content is displayed --
         if _thinking_acc:
             full = "💭 **Thinking**\n\n" + "".join(_thinking_acc)
             if _thinking_card_id:
@@ -310,9 +310,22 @@ class FeishuBot:
                 try:
                     await self._update_card(_result_card_id, full)
                 except Exception:
-                    pass
+                    log.warning("[FinalFlush] update result card %s failed, will retry", _result_card_id)
+                    # Retry once after a short delay
+                    await asyncio.sleep(1.0)
+                    try:
+                        await self._update_card(_result_card_id, full)
+                    except Exception:
+                        log.error("[FinalFlush] retry update result card %s also failed", _result_card_id)
             elif full.strip():
-                await self._reply_card(msg_id, full)
+                card_id = await self._reply_card(msg_id, full)
+                if card_id is None and full.strip():
+                    # Card creation failed -- retry after delay
+                    log.warning("[FinalFlush] reply_card returned None for result (%d chars), retrying in 2s", len(full))
+                    await asyncio.sleep(2.0)
+                    card_id = await self._reply_card(msg_id, full)
+                    if card_id is None:
+                        log.error("[FinalFlush] retry reply_card also returned None -- user will NOT see result")
 
         if not saw_stream_event:
             card_content = self._format_result(result)
@@ -392,9 +405,9 @@ class FeishuBot:
         """Format StreamResult into rich Markdown for Feishu card.
 
         Layout:
-        1. 💭 Thinking (collapsed if long) — shows Claude's reasoning
-        2. 🔧 Tool Calls — shows what commands/files were accessed
-        3. 📝 Reply — the actual response text
+        1. 💭 Thinking (collapsed if long) -- shows Claude's reasoning
+        2. 🔧 Tool Calls -- shows what commands/files were accessed
+        3. 📝 Reply -- the actual response text
         """
         sections: list[str] = []
 
@@ -505,10 +518,25 @@ class FeishuBot:
                 .build()
             )
             resp = await asyncio.to_thread(self._api_client.im.v1.message.reply, req)
+            # Enhanced error logging: check response status
+            code = getattr(resp, "code", None)
+            resp_msg = getattr(resp, "msg", None)
+            if code and code != 0:
+                log.error(
+                    "[ReplyCard] API error for msg=%s code=%s msg=%s text_len=%d",
+                    msg_id, code, resp_msg, len(text),
+                )
+                return None
             data = getattr(resp, "data", None)
-            return getattr(data, "message_id", None) if data else None
+            card_id = getattr(data, "message_id", None) if data else None
+            if card_id is None:
+                log.warning(
+                    "[ReplyCard] no message_id in response for msg=%s code=%s resp_msg=%s text_len=%d",
+                    msg_id, code, resp_msg, len(text),
+                )
+            return card_id
         except Exception:
-            log.exception("Reply card failed for %s", msg_id)
+            log.exception("Reply card failed for %s (text_len=%d)", msg_id, len(text))
             return None
 
     async def _update_card(self, card_id: str, text: str) -> None:
@@ -520,9 +548,17 @@ class FeishuBot:
                 .request_body(self._sdk["PatchBody"].builder().content(self._card(text)).build())
                 .build()
             )
-            await asyncio.to_thread(self._api_client.im.v1.message.patch, req)
+            resp = await asyncio.to_thread(self._api_client.im.v1.message.patch, req)
+            # Enhanced error logging: check response status
+            code = getattr(resp, "code", None)
+            resp_msg = getattr(resp, "msg", None)
+            if code and code != 0:
+                log.error(
+                    "[UpdateCard] API error for card=%s code=%s msg=%s text_len=%d",
+                    card_id, code, resp_msg, len(text),
+                )
         except Exception:
-            log.exception("Update card failed for %s", card_id)
+            log.exception("Update card failed for %s (text_len=%d)", card_id, len(text))
 
     @staticmethod
     def _card(text: str) -> str:
