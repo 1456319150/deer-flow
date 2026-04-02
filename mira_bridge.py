@@ -9,8 +9,13 @@ Key design decisions:
     - Reason events are classified by data.type:
         * stream_event — actual Claude streaming deltas (process these)
         * assistant — full accumulated snapshot (skip to avoid duplicates)
-        * user — tool result injected back (internal, not surfaced)
+        * user — tool results → surfaced as tool_result events
         * system — metadata (skip)
+    - Tool call lifecycle:
+        1. content_block_start (block_type=tool_use) → record name/id
+        2. input_json_delta events → accumulate partial JSON
+        3. content_block_stop → yield StreamEvent(kind="tool_use")
+        4. user event with tool_result blocks → yield StreamEvent(kind="tool_result")
     - Content event maps to a single "result" StreamEvent (fallback).
 """
 from __future__ import annotations
@@ -115,11 +120,16 @@ class MiraBridge:
         result.session_id = session_id
 
         # ── Streaming state ────────────────────────────────────────
-        # Track current content block type from content_block_start
         current_block: str = ""           # "thinking" | "text" | "tool_use" | ""
         thinking_chunks: list[str] = []   # accumulated thinking text
         result_chunks: list[str] = []     # accumulated answer text
-        _tool_phase_notified: bool = False  # sent "researching" status once?
+
+        # Tool call tracking: accumulate input_json_delta for current tool_use
+        _cur_tool_name: str = ""
+        _cur_tool_use_id: str = ""
+        _cur_tool_input_chunks: list[str] = []
+        # Map tool_use_id → tool_name for correlating tool_result events
+        _tool_names: dict[str, str] = {}
 
         try:
             async for evt in self.client.chat(
@@ -144,8 +154,7 @@ class MiraBridge:
 
                 # ── reason event: classify by data_type ────────────
 
-                # Skip assistant summaries (full accumulated text, NOT a delta)
-                # and system metadata — these cause duplicate output if processed
+                # Skip assistant summaries and system/safety metadata
                 if evt.data_type in ("assistant", "system", "safety_audit"):
                     log.debug(
                         "[MiraBridge] skip %s reason (not a delta)",
@@ -153,10 +162,11 @@ class MiraBridge:
                     )
                     continue
 
-                # Skip user events (internal tool results — not for display)
+                # ── user events: tool results ──────────────────────
                 if evt.data_type == "user":
-                    log.debug("[MiraBridge] tool result (internal): %s",
-                              evt.text[:100] if evt.text else "")
+                    # Parse tool_result blocks from user message content
+                    for tr_evt in self._parse_user_tool_results(evt, _tool_names):
+                        yield tr_evt
                     continue
 
                 # ── stream_event or untyped reason: streaming deltas ─
@@ -166,28 +176,53 @@ class MiraBridge:
                     current_block = evt.block_type
                     log.debug("[MiraBridge] block start: %s", current_block)
 
-                    # Log tool_use blocks silently (internal Mira tool calls)
                     if evt.block_type == "tool_use":
-                        log.info("[MiraBridge] tool call: %s",
-                                 evt.tool_name or "unknown")
-                        # Notify user once that deep research is in progress
-                        if not _tool_phase_notified:
-                            _tool_phase_notified = True
-                            yield {
-                                "type": "stream_event",
-                                "event": StreamEvent(
-                                    kind="thinking",
-                                    text="\U0001f50d 正在深度调研中，请稍候...\n",
-                                ),
-                            }
+                        # Start tracking a new tool call
+                        _cur_tool_name = evt.tool_name or ""
+                        _cur_tool_use_id = evt.tool_use_id or ""
+                        _cur_tool_input_chunks = []
+                        if _cur_tool_use_id and _cur_tool_name:
+                            _tool_names[_cur_tool_use_id] = _cur_tool_name
+                        log.info(
+                            "[MiraBridge] tool_use start: name=%s id=%s",
+                            _cur_tool_name, _cur_tool_use_id,
+                        )
                     continue
 
                 if evt.inner_type == "content_block_stop":
+                    # When a tool_use block ends, emit the complete tool_use event
+                    if current_block == "tool_use" and _cur_tool_use_id:
+                        tool_input = "".join(_cur_tool_input_chunks)
+                        # Try to pretty-format the JSON input for readability
+                        tool_input_display = self._format_tool_input(
+                            tool_input, _cur_tool_name
+                        )
+                        log.info(
+                            "[MiraBridge] tool_use complete: name=%s id=%s input_len=%d",
+                            _cur_tool_name, _cur_tool_use_id, len(tool_input),
+                        )
+                        yield {
+                            "type": "stream_event",
+                            "event": StreamEvent(
+                                kind="tool_use",
+                                text=tool_input_display,
+                                tool_name=_cur_tool_name,
+                                tool_use_id=_cur_tool_use_id,
+                            ),
+                        }
+                        # Reset tool tracking
+                        _cur_tool_name = ""
+                        _cur_tool_use_id = ""
+                        _cur_tool_input_chunks = []
                     current_block = ""
                     continue
 
-                # Skip input_json_delta (tool input JSON streaming, not display text)
+                # Accumulate input_json_delta for tool_use blocks
                 if evt.delta_type == "input_json_delta":
+                    delta = evt.data.get("event", {}).get("delta", {})
+                    partial = delta.get("partial_json", "")
+                    if partial:
+                        _cur_tool_input_chunks.append(partial)
                     continue
 
                 # Only process events with text deltas
@@ -225,6 +260,102 @@ class MiraBridge:
 
         result.stop_reason = "end_turn"
         yield {"type": "final", "result": result}
+
+    # ── Tool event helpers ─────────────────────────────────────────
+
+    @staticmethod
+    def _parse_user_tool_results(
+        evt: Any, tool_names: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        """Extract tool_result events from a 'user' reason event.
+
+        Mira wraps Claude's tool results in user-type reason events:
+        data.message.content = [
+            {"type": "tool_result", "tool_use_id": "...", "content": "..."},
+            ...
+        ]
+
+        Returns a list of stream_event dicts to yield.
+        """
+        events: list[dict[str, Any]] = []
+        msg = evt.data.get("message", {}) if isinstance(evt.data, dict) else {}
+        if not isinstance(msg, dict):
+            return events
+
+        blocks = msg.get("content", [])
+        if not isinstance(blocks, list):
+            return events
+
+        for blk in blocks:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") != "tool_result":
+                continue
+
+            tool_use_id = blk.get("tool_use_id", "")
+            tool_name = tool_names.get(tool_use_id, "")
+
+            # Extract text from tool_result content
+            content = blk.get("content", "")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                # content can be [{type: "text", text: "..."}, ...]
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("text"):
+                        text_parts.append(item["text"])
+                text = "\n".join(text_parts)
+
+            log.info(
+                "[MiraBridge] tool_result: name=%s id=%s text_len=%d",
+                tool_name or "unknown", tool_use_id, len(text),
+            )
+            events.append({
+                "type": "stream_event",
+                "event": StreamEvent(
+                    kind="tool_result",
+                    text=text,
+                    tool_name=tool_name,
+                    tool_use_id=tool_use_id,
+                ),
+            })
+
+        return events
+
+    @staticmethod
+    def _format_tool_input(raw_json: str, tool_name: str) -> str:
+        """Format tool input JSON for display.
+
+        For readability, extract key fields from common tool inputs.
+        Falls back to raw JSON if parsing fails.
+        """
+        if not raw_json:
+            return ""
+        try:
+            parsed = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError):
+            return raw_json[:500]
+
+        # For search tools, show the query
+        if isinstance(parsed, dict):
+            query = parsed.get("query") or parsed.get("prompt") or parsed.get("content")
+            if query and isinstance(query, str):
+                return query
+
+            # For web fetch, show the URL
+            url = parsed.get("url")
+            if not url and isinstance(parsed.get("data"), dict):
+                url = parsed["data"].get("url")
+            if url and isinstance(url, str):
+                return url
+
+        # Fallback: compact JSON
+        compact = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        if len(compact) > 500:
+            return compact[:500] + "..."
+        return compact
 
     # ── Session management (matches ClaudeCodeBridge) ──────────────
 
