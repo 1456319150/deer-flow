@@ -141,28 +141,78 @@ class FeishuBot:
             log.exception("Error processing message")
 
     async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
-        """Full message lifecycle: react -> stream cards -> done."""
+        """Full message lifecycle: react -> stream cards -> done.
+
+        Card ordering strategy:
+        We use three debounced cards that are created in strict order:
+          1. 💭 Thinking card  — created on first thinking event
+          2. 🔧 Process card   — created on first tool_use event (AFTER thinking card exists)
+          3. ✅ Result card     — created on first result event  (AFTER process card exists)
+
+        All three use the same background flusher to debounce updates, ensuring
+        that Feishu receives card creation requests in the correct chronological
+        order. Tool calls are accumulated into a single process card rather than
+        creating separate cards per tool call.
+        """
         await self._react(msg_id, "OK")
         result = StreamResult()
         emitted_event_keys: set[tuple[str, str]] = set()
         streamed_texts: list[str] = []
-        tool_cards: dict[str, dict[str, str | None]] = {}
         saw_stream_event = False
 
-        # --- Streaming card state ---
+        # --- Streaming card state (3 ordered cards) ---
         _thinking_card_id: str | None = None
         _thinking_acc: list[str] = []
+        _thinking_dirty = False
+
+        _process_card_id: str | None = None
+        _process_blocks: list[str] = []       # formatted tool blocks in order
+        _process_dirty = False
+        _tool_block_index: dict[str, int] = {}  # tool_use_id -> index in _process_blocks
+
         _result_card_id: str | None = None
         _result_acc: list[str] = []
-        _thinking_dirty = False  # new content since last flush
         _result_dirty = False
-        _FLUSH_INTERVAL = 0.5  # seconds between card updates (was 1.0)
+
+        _FLUSH_INTERVAL = 0.5  # seconds between card updates
+
+        # --- Ensure card creation order ---
+        # We must create cards in order: thinking -> process -> result.
+        # If a later card needs creation but an earlier one hasn't been created yet,
+        # we force-create the earlier one first.
+
+        async def _ensure_thinking_card():
+            """Ensure thinking card exists (create if needed)."""
+            nonlocal _thinking_card_id
+            if _thinking_card_id is None and _thinking_acc:
+                full = "💭 **Thinking...**\n\n" + "".join(_thinking_acc)
+                _thinking_card_id = await self._reply_card(msg_id, full)
+
+        async def _ensure_process_card():
+            """Ensure process card exists, creating thinking card first if needed."""
+            nonlocal _process_card_id
+            if _process_card_id is None and _process_blocks:
+                await _ensure_thinking_card()
+                content = self._build_process_card(_process_blocks)
+                _process_card_id = await self._reply_card(msg_id, content)
+
+        async def _ensure_result_card():
+            """Ensure result card exists, creating earlier cards first if needed."""
+            nonlocal _result_card_id
+            if _result_card_id is None and _result_acc:
+                await _ensure_thinking_card()
+                await _ensure_process_card()
+                full = "".join(_result_acc)
+                _result_card_id = await self._reply_card(msg_id, full)
 
         async def _flush_cards():
             """Background flusher: periodically update cards with accumulated text."""
-            nonlocal _thinking_dirty, _result_dirty, _thinking_card_id, _result_card_id
+            nonlocal _thinking_dirty, _process_dirty, _result_dirty
+            nonlocal _thinking_card_id, _process_card_id, _result_card_id
             while True:
                 await asyncio.sleep(_FLUSH_INTERVAL)
+
+                # Flush thinking card
                 if _thinking_dirty and _thinking_acc:
                     _thinking_dirty = False
                     full = "💭 **Thinking...**\n\n" + "".join(_thinking_acc)
@@ -173,8 +223,27 @@ class FeishuBot:
                             log.debug("flush thinking card update failed")
                     else:
                         _thinking_card_id = await self._reply_card(msg_id, full)
+
+                # Flush process card (tool calls)
+                if _process_dirty and _process_blocks:
+                    _process_dirty = False
+                    # Ensure thinking card is created first (ordering guarantee)
+                    await _ensure_thinking_card()
+                    content = self._build_process_card(_process_blocks)
+                    if _process_card_id:
+                        try:
+                            await self._update_card(_process_card_id, content)
+                        except Exception:
+                            log.debug("flush process card update failed")
+                    else:
+                        _process_card_id = await self._reply_card(msg_id, content)
+
+                # Flush result card
                 if _result_dirty and _result_acc:
                     _result_dirty = False
+                    # Ensure earlier cards are created first (ordering guarantee)
+                    await _ensure_thinking_card()
+                    await _ensure_process_card()
                     full = "".join(_result_acc)
                     if _result_card_id:
                         try:
@@ -198,50 +267,69 @@ class FeishuBot:
                         len(stream_event.text),
                         _preview_text(stream_event.text),
                     )
-                    # -- Streaming delta handling (Mira bridge) --
+
+                    # -- Thinking: accumulate into thinking card --
                     if stream_event.kind == "thinking" and stream_event.text:
                         _thinking_acc.append(stream_event.text)
                         _thinking_dirty = True
                         continue
 
+                    # -- Result: accumulate into result card --
                     if stream_event.kind == "result" and stream_event.text:
                         _result_acc.append(stream_event.text)
                         _result_dirty = True
                         continue
 
+                    # -- Tool use: add block to process card --
+                    if stream_event.kind == "tool_use":
+                        block = self._format_stream_event(stream_event)
+                        if block:
+                            idx = len(_process_blocks)
+                            _process_blocks.append(block)
+                            if stream_event.tool_use_id:
+                                _tool_block_index[stream_event.tool_use_id] = idx
+                            _process_dirty = True
+                            log.info(
+                                "[RenderProcess] action=add_tool_use tool=%s id=%s block_idx=%d",
+                                stream_event.tool_name or "-",
+                                stream_event.tool_use_id or "-",
+                                idx,
+                            )
+                        continue
+
+                    # -- Tool result: merge into existing tool block in process card --
+                    if stream_event.kind == "tool_result":
+                        if stream_event.tool_use_id and stream_event.tool_use_id in _tool_block_index:
+                            idx = _tool_block_index[stream_event.tool_use_id]
+                            old_block = _process_blocks[idx]
+                            merged = self._merge_tool_stream_blocks(old_block, stream_event)
+                            if merged and merged != old_block:
+                                _process_blocks[idx] = merged
+                                _process_dirty = True
+                                log.info(
+                                    "[RenderProcess] action=merge_tool_result tool=%s id=%s block_idx=%d",
+                                    stream_event.tool_name or "-",
+                                    stream_event.tool_use_id,
+                                    idx,
+                                )
+                        else:
+                            # Unbound tool result — add as standalone block
+                            block = self._format_stream_event(stream_event)
+                            if block:
+                                _process_blocks.append(block)
+                                _process_dirty = True
+                                log.info(
+                                    "[RenderProcess] action=add_unbound_tool_result tool=%s id=%s",
+                                    stream_event.tool_name or "-",
+                                    stream_event.tool_use_id or "-",
+                                )
+                        continue
+
+                    # -- Text events: accumulate for dedup tracking --
                     if stream_event.kind == "text":
                         streamed_texts.append(stream_event.text)
-                    if stream_event.kind == "result":
-                        current_reply = "\n\n".join(streamed_texts).strip()
-                        if not stream_event.text or stream_event.text == current_reply:
-                            continue
-                    if stream_event.kind == "tool_result" and stream_event.tool_use_id in tool_cards:
-                        tool_card = tool_cards[stream_event.tool_use_id]
-                        merged = self._merge_tool_stream_blocks(str(tool_card["tool_use_block"]), stream_event)
-                        if not merged or merged == tool_card.get("content"):
-                            continue
-                        if tool_card.get("card_id"):
-                            log.info(
-                                "[RenderCard] mode=update content_len=%d tool_use_id=%s",
-                                len(merged),
-                                stream_event.tool_use_id,
-                            )
-                            await self._update_card(str(tool_card["card_id"]), merged)
-                        else:
-                            log.info(
-                                "[RenderCard] mode=reply reason=missing_card_id_fallback tool=%s tool_use_id=%s",
-                                stream_event.tool_name or "-",
-                                stream_event.tool_use_id,
-                            )
-                            await self._reply_card(msg_id, merged)
-                        tool_card["content"] = merged
-                        continue
-                    if stream_event.kind == "tool_result" and stream_event.tool_use_id:
-                        log.info(
-                            "[RenderCard] mode=reply reason=unbound_tool_result tool=%s tool_use_id=%s",
-                            stream_event.tool_name or "-",
-                            stream_event.tool_use_id,
-                        )
+
+                    # Skip duplicate text/result events
                     block = self._format_stream_event(stream_event)
                     if not block:
                         continue
@@ -260,26 +348,7 @@ class FeishuBot:
                         len(block),
                         stream_event.kind,
                     )
-                    card_id = await self._reply_card(msg_id, block)
-                    if stream_event.kind == "tool_use" and stream_event.tool_use_id:
-                        tool_cards[stream_event.tool_use_id] = {
-                            "card_id": card_id,
-                            "tool_use_block": block,
-                            "content": block,
-                        }
-                        if card_id:
-                            log.info(
-                                "[RenderCard] mode=bind tool=%s tool_use_id=%s card_id=%s",
-                                stream_event.tool_name or "-",
-                                stream_event.tool_use_id,
-                                card_id,
-                            )
-                        else:
-                            log.info(
-                                "[RenderCard] mode=bind_skipped reason=missing_card_id tool=%s tool_use_id=%s",
-                                stream_event.tool_name or "-",
-                                stream_event.tool_use_id,
-                            )
+                    await self._reply_card(msg_id, block)
                 elif event["type"] == "final":
                     result = event["result"]
         except Exception as e:
@@ -294,6 +363,7 @@ class FeishuBot:
             pass
 
         # -- Final flush -- ensure all accumulated content is displayed --
+        # Order matters: thinking -> process -> result
         if _thinking_acc:
             full = "💭 **Thinking**\n\n" + "".join(_thinking_acc)
             if _thinking_card_id:
@@ -302,7 +372,21 @@ class FeishuBot:
                 except Exception:
                     pass
             else:
-                await self._reply_card(msg_id, full)
+                _thinking_card_id = await self._reply_card(msg_id, full)
+
+        if _process_blocks:
+            content = self._build_process_card(_process_blocks)
+            if _process_card_id:
+                try:
+                    await self._update_card(_process_card_id, content)
+                except Exception:
+                    pass
+            else:
+                # Ensure thinking card exists before creating process card
+                if _thinking_acc and not _thinking_card_id:
+                    full = "💭 **Thinking**\n\n" + "".join(_thinking_acc)
+                    _thinking_card_id = await self._reply_card(msg_id, full)
+                _process_card_id = await self._reply_card(msg_id, content)
 
         if _result_acc:
             full = "".join(_result_acc)
@@ -318,6 +402,11 @@ class FeishuBot:
                     except Exception:
                         log.error("[FinalFlush] retry update result card %s also failed", _result_card_id)
             elif full.strip():
+                # Ensure earlier cards exist before creating result card
+                if _thinking_acc and not _thinking_card_id:
+                    pass  # Already handled above
+                if _process_blocks and not _process_card_id:
+                    pass  # Already handled above
                 card_id = await self._reply_card(msg_id, full)
                 if card_id is None and full.strip():
                     # Card creation failed -- retry after delay
@@ -358,6 +447,23 @@ class FeishuBot:
         return None
 
     @classmethod
+    def _build_process_card(cls, blocks: list[str]) -> str:
+        """Build the unified process card content from accumulated tool blocks.
+
+        Shows all tool calls in a single card with a header indicating count.
+        """
+        if not blocks:
+            return ""
+        n = len(blocks)
+        header = f"**🔧 Tool Calls ({n})**\n\n"
+        # Join blocks with separator
+        body = "\n\n---\n\n".join(blocks)
+        content = header + body
+        if len(content) > cls.MAX_REPLY:
+            content = content[:cls.MAX_REPLY] + "\n\n... (truncated)"
+        return content
+
+    @classmethod
     def _format_stream_event(cls, event: StreamEvent) -> str:
         text = event.text.strip()
         if event.kind == "thinking":
@@ -368,12 +474,12 @@ class FeishuBot:
             if len(text) > cls.MAX_TOOL_INPUT:
                 text = text[:cls.MAX_TOOL_INPUT] + "..."
             title = event.tool_name or "unknown"
-            return f"**🔧 Tool Use: {title}**\n`{text}`" if text else f"**🔧 Tool Use: {title}**"
+            return f"**{title}**\n`{text}`" if text else f"**{title}**"
         if event.kind == "tool_result":
             if len(text) > cls.MAX_TOOL_OUTPUT:
                 text = text[:cls.MAX_TOOL_OUTPUT] + "..."
             title = event.tool_name or "unknown"
-            return f"**📦 Tool Result: {title}**\n> {cls._blockquote(text)}" if text else f"**📦 Tool Result: {title}**"
+            return f"📦 **{title}** result\n> {cls._blockquote(text)}" if text else f"📦 **{title}** result"
         if event.kind == "result":
             if len(text) > cls.MAX_REPLY:
                 text = text[:cls.MAX_REPLY] + "\n\n... (truncated, response too long)"
