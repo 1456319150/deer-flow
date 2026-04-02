@@ -962,6 +962,7 @@ async def main() -> None:
     await feishu_bot.start()
 
     # WeChat channel (optional)
+    weixin_bot = None
     weixin_cfg = cfg.get("weixin", {})
     if weixin_cfg.get("enabled"):
         from weixin_bot import WeixinBot
@@ -973,6 +974,21 @@ async def main() -> None:
         await asyncio.Event().wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutting down...")
+    finally:
+        # Close WeChat channel (aiohttp ClientSession)
+        if weixin_bot is not None and hasattr(weixin_bot, "_channel") and weixin_bot._channel is not None:
+            try:
+                await weixin_bot._channel.close()
+                log.info("[Shutdown] WeixinChannel closed.")
+            except Exception:
+                log.exception("[Shutdown] Error closing WeixinChannel")
+        # Close Mira bridge (httpx AsyncClient)
+        if hasattr(bridge, "client") and hasattr(bridge.client, "close"):
+            try:
+                await bridge.client.close()
+                log.info("[Shutdown] MiraClient closed.")
+            except Exception:
+                log.exception("[Shutdown] Error closing MiraClient")
 
 
 if __name__ == "__main__":

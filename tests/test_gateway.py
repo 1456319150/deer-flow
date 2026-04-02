@@ -343,8 +343,12 @@ class TestFormatResult(unittest.TestCase):
 
     def test_format_stream_event_variants(self):
         self.assertIn("💭 Thinking", FeishuBot._format_stream_event(StreamEvent(kind="thinking", text="analyzing")))
-        self.assertIn("🔧 Tool Use: Bash", FeishuBot._format_stream_event(StreamEvent(kind="tool_use", tool_name="Bash", text="pwd")))
-        self.assertIn("📦 Tool Result: Bash", FeishuBot._format_stream_event(StreamEvent(kind="tool_result", tool_name="Bash", text="/repo")))
+        tool_use_out = FeishuBot._format_stream_event(StreamEvent(kind="tool_use", tool_name="Bash", text="pwd"))
+        self.assertIn("**Bash**", tool_use_out)
+        self.assertIn("`pwd`", tool_use_out)
+        tool_result_out = FeishuBot._format_stream_event(StreamEvent(kind="tool_result", tool_name="Bash", text="/repo"))
+        self.assertIn("📦 **Bash** result", tool_result_out)
+        self.assertIn("/repo", tool_result_out)
         self.assertIn("✅ Result", FeishuBot._format_stream_event(StreamEvent(kind="result", text="done")))
         self.assertEqual("reply", FeishuBot._format_stream_event(StreamEvent(kind="text", text="reply")))
 
@@ -747,6 +751,7 @@ class TestSessionManagement(unittest.TestCase):
 class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
 
     async def test_handle_stream_events_merge_tool_result_into_tool_use_card(self):
+        """Tool results are merged into the same thinking+tools card (2-card model)."""
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
@@ -758,25 +763,30 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
             yield {"type": "final", "result": StreamResult(assistant_texts=["最终回复"])}
 
         bot.bridge.stream_ask = fake_stream_ask
-        bot._reply_card = AsyncMock(side_effect=["card-thinking", "card-tool", "card-text"])
+        bot._reply_card = AsyncMock(side_effect=["card-text", "card-thinking"])
         bot._update_card = AsyncMock()
         bot._react = AsyncMock()
+        bot._resolve_images = AsyncMock(side_effect=lambda text: text)
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        self.assertEqual(bot._reply_card.await_count, 3)
+        # 2-card model: text card + combined thinking+tools card
+        self.assertEqual(bot._reply_card.await_count, 2)
         rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
-        self.assertIn("💭 Thinking", rendered_contents[0])
-        self.assertIn("🔧 Tool Use: Bash", rendered_contents[1])
-        self.assertEqual("最终回复", rendered_contents[2])
-        bot._update_card.assert_awaited_once()
-        self.assertEqual(bot._update_card.await_args.args[0], "card-tool")
-        merged_content = bot._update_card.await_args.args[1]
-        self.assertIn("🔧 Tool Use: Bash", merged_content)
-        self.assertIn("📦 Tool Result: Bash", merged_content)
+        # First card: the text event reply
+        self.assertEqual("最终回复", rendered_contents[0])
+        # Second card: combined thinking + tool calls (including merged result)
+        combined_card = rendered_contents[1]
+        self.assertIn("💭", combined_card)
+        self.assertIn("先思考", combined_card)
+        self.assertIn("🔧 Tool Calls", combined_card)
+        self.assertIn("**Bash**", combined_card)
+        self.assertIn("📦 **Bash** result", combined_card)
+        self.assertIn("/repo", combined_card)
         self.assertEqual(bot._react.await_count, 2)
 
     async def test_handle_skips_duplicate_result_event(self):
+        """Duplicate result text does not produce an extra card beyond text + result."""
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
@@ -788,13 +798,20 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bot.bridge.stream_ask = fake_stream_ask
         bot._reply_card = AsyncMock(return_value="card_1")
         bot._react = AsyncMock()
+        bot._resolve_images = AsyncMock(side_effect=lambda text: text)
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        self.assertEqual(bot._reply_card.await_count, 1)
-        self.assertNotIn("✅ Result", bot._reply_card.await_args.args[1])
+        # 2 cards: text event card + result accumulation card.
+        # No extra duplicate card beyond these two.
+        self.assertEqual(bot._reply_card.await_count, 2)
+        rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
+        # Neither card should have "✅ Result" header (result goes to _result_acc raw)
+        for c in rendered_contents:
+            self.assertNotIn("✅ Result", c)
 
     async def test_handle_repeated_read_tool_use_is_not_deduped_by_same_path(self):
+        """Two Read calls with the same path are both shown (not deduped)."""
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
@@ -812,21 +829,27 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bot._reply_card = AsyncMock(side_effect=["card-1", "card-2", "card-3"])
         bot._update_card = AsyncMock()
         bot._react = AsyncMock()
+        bot._resolve_images = AsyncMock(side_effect=lambda text: text)
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        self.assertEqual(bot._reply_card.await_count, 3)
+        # 2-card model: one combined thinking+tools card, one fallback card
+        self.assertEqual(bot._reply_card.await_count, 2)
         rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
-        self.assertIn("🔧 Tool Use: Read", rendered_contents[0])
-        self.assertIn("🔧 Tool Use: Read", rendered_contents[1])
-        self.assertEqual(bot._update_card.await_count, 2)
-        self.assertEqual(bot._update_card.await_args_list[0].args[0], "card-1")
-        self.assertEqual(bot._update_card.await_args_list[1].args[0], "card-2")
-        self.assertIn("📦 Tool Result: Read", bot._update_card.await_args_list[0].args[1])
-        self.assertIn("first", bot._update_card.await_args_list[0].args[1])
-        self.assertIn("second", bot._update_card.await_args_list[1].args[1])
+        # First card: combined tool calls card with both Read calls
+        combined_card = rendered_contents[0]
+        self.assertIn("🔧 Tool Calls (2)", combined_card)
+        # Both tool uses present (not deduped despite same path)
+        # The header "Tool Calls (2)" confirms both tools are included.
+        # Also verify both tool result blocks are present.
+        self.assertEqual(combined_card.count(chr(128230) + " **Read** result"), 2)
+        # Both results merged into their respective tool blocks
+        self.assertIn("first", combined_card)
+        self.assertIn("second", combined_card)
+        self.assertIn("📦 **Read** result", combined_card)
 
     async def test_handle_missing_card_id_falls_back_to_merged_reply(self):
+        """When thinking card creation returns None, content is still delivered."""
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
@@ -841,19 +864,22 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bot._reply_card = AsyncMock(side_effect=[None, "fallback-card", "final-card"])
         bot._update_card = AsyncMock()
         bot._react = AsyncMock()
+        bot._resolve_images = AsyncMock(side_effect=lambda text: text)
 
         await bot._handle("chat", "msg", "topic", "hello")
 
-        self.assertEqual(bot._reply_card.await_count, 3)
+        # 2-card model: thinking+tools card (returns None) + fallback text card
+        self.assertEqual(bot._reply_card.await_count, 2)
+        # First card: combined thinking+tools (returned None)
         first_card = bot._reply_card.await_args_list[0].args[1]
-        second_card = bot._reply_card.await_args_list[1].args[1]
-        self.assertIn("🔧 Tool Use: Bash", first_card)
-        self.assertIn("🔧 Tool Use: Bash", second_card)
-        self.assertIn("📦 Tool Result: Bash", second_card)
-        self.assertIn("working tree clean", second_card)
+        self.assertIn("🔧 Tool Calls", first_card)
+        self.assertIn("**Bash**", first_card)
+        self.assertIn("working tree clean", first_card)
+        # Even though first card returned None, a second card is still sent
         bot._update_card.assert_not_awaited()
 
     async def test_handle_without_stream_text_appends_final_reply(self):
+        """Final reply text is appended even without streaming text events."""
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
@@ -864,11 +890,15 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bot.bridge.stream_ask = fake_stream_ask
         bot._reply_card = AsyncMock(return_value="card_1")
         bot._react = AsyncMock()
+        bot._resolve_images = AsyncMock(side_effect=lambda text: text)
 
         await bot._handle("chat", "msg", "topic", "hello")
 
         rendered_contents = [call.args[1] for call in bot._reply_card.await_args_list]
-        self.assertIn("🔧 Tool Use: Bash", rendered_contents[0])
+        # First card: combined thinking+tools card with tool call
+        self.assertIn("🔧 Tool Calls", rendered_contents[0])
+        self.assertIn("**Bash**", rendered_contents[0])
+        # Last card: the final reply text
         self.assertIn("已推送到 origin/main", rendered_contents[-1])
 
     async def test_handle_without_stream_events_falls_back_to_final_result(self):
