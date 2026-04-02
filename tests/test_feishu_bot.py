@@ -109,8 +109,9 @@ class TestEventDedupKey:
         assert FeishuBot._event_dedup_key(evt) is None
 
 
+
 class TestCardOrderingIntegration:
-    """Integration-style tests verifying card creation order."""
+    """Integration-style tests verifying 2-card model (thinking+tools, result)."""
 
     @pytest.fixture
     def bot(self):
@@ -118,30 +119,24 @@ class TestCardOrderingIntegration:
         cfg = {"app_id": "test", "app_secret": "test"}
         bridge = MagicMock()
         bot = FeishuBot(cfg, bridge)
-        # Mock the API methods
         bot._reply_card = AsyncMock(side_effect=lambda mid, text: f"card_{id(text)}")
         bot._update_card = AsyncMock()
         bot._react = AsyncMock()
+        # Skip image upload in tests
+        bot._resolve_images = AsyncMock(side_effect=lambda text: text)
         return bot
 
     @pytest.mark.asyncio
-    async def test_card_creation_order_thinking_tools_result(self, bot):
-        """Cards must be created in order: thinking -> process -> result."""
-        card_creation_order = []
-        original_reply = bot._reply_card
+    async def test_thinking_and_tools_merged_in_one_card(self, bot):
+        """Thinking + tool calls should appear in a single combined card."""
+        reply_texts = []
 
-        async def tracking_reply(msg_id, text):
-            if "Thinking" in text:
-                card_creation_order.append("thinking")
-            elif "🔧 Tool Calls" in text:
-                card_creation_order.append("process")
-            elif "Thinking" not in text and "🔧" not in text and "Usage" not in text:
-                card_creation_order.append("result")
-            return f"card_{len(card_creation_order)}"
+        async def capture_reply(msg_id, text):
+            reply_texts.append(text)
+            return f"card_{len(reply_texts)}"
 
-        bot._reply_card = AsyncMock(side_effect=tracking_reply)
+        bot._reply_card = AsyncMock(side_effect=capture_reply)
 
-        # Simulate stream events in realistic order
         events = [
             {"type": "stream_event", "event": StreamEvent(kind="thinking", text="let me think...")},
             {"type": "stream_event", "event": StreamEvent(kind="tool_use", text="search query",
@@ -157,20 +152,48 @@ class TestCardOrderingIntegration:
                 yield e
 
         bot.bridge.stream_ask = fake_stream
-
         await bot._handle("chat_1", "msg_1", "topic_1", "test query")
 
-        # Verify order: thinking must come before process, process before result
-        if "thinking" in card_creation_order and "process" in card_creation_order:
-            assert card_creation_order.index("thinking") < card_creation_order.index("process"), \
-                f"thinking must be before process, got: {card_creation_order}"
-        if "process" in card_creation_order and "result" in card_creation_order:
-            assert card_creation_order.index("process") < card_creation_order.index("result"), \
-                f"process must be before result, got: {card_creation_order}"
+        # Final flush should produce a combined card with both Thinking and Tool Calls
+        combined = [t for t in reply_texts if "Thinking" in t and "Tool Calls" in t]
+        assert len(combined) >= 1, f"Expected combined thinking+tools card, got: {reply_texts}"
 
     @pytest.mark.asyncio
-    async def test_multiple_tools_accumulate_in_single_card(self, bot):
-        """Multiple tool_use events should accumulate into one process card, not separate cards."""
+    async def test_thinking_card_before_result_card(self, bot):
+        """The thinking card must be created before the result card."""
+        card_order = []
+
+        async def tracking_reply(msg_id, text):
+            if "Thinking" in text or "Tool Calls" in text:
+                card_order.append("thinking")
+            elif "Usage" not in text:
+                card_order.append("result")
+            return f"card_{len(card_order)}"
+
+        bot._reply_card = AsyncMock(side_effect=tracking_reply)
+
+        events = [
+            {"type": "stream_event", "event": StreamEvent(kind="thinking", text="hmm...")},
+            {"type": "stream_event", "event": StreamEvent(kind="tool_use", text="q",
+                                                           tool_name="search", tool_use_id="tu_1")},
+            {"type": "stream_event", "event": StreamEvent(kind="result", text="answer")},
+            {"type": "final", "result": StreamResult()},
+        ]
+
+        async def fake_stream(topic_id, text):
+            for e in events:
+                yield e
+
+        bot.bridge.stream_ask = fake_stream
+        await bot._handle("chat_1", "msg_1", "topic_1", "test")
+
+        if "thinking" in card_order and "result" in card_order:
+            assert card_order.index("thinking") < card_order.index("result"), \
+                f"thinking must come before result, got: {card_order}"
+
+    @pytest.mark.asyncio
+    async def test_multiple_tools_in_thinking_card(self, bot):
+        """Multiple tool_use events should accumulate in the thinking card."""
         reply_texts = []
 
         async def capture_reply(msg_id, text):
@@ -193,21 +216,116 @@ class TestCardOrderingIntegration:
                 yield e
 
         bot.bridge.stream_ask = fake_stream
-
         await bot._handle("chat_1", "msg_1", "topic_1", "test")
 
-        # Find the process card — should contain BOTH tools
-        process_cards = [t for t in reply_texts if "🔧 Tool Calls" in t]
-        assert len(process_cards) >= 1, f"Expected at least 1 process card, got texts: {reply_texts}"
-        # The final process card should mention both tools
-        final_process = process_cards[-1]
-        assert "search" in final_process
-        assert "fetch" in final_process
+        tool_cards = [t for t in reply_texts if "Tool Calls" in t]
+        assert len(tool_cards) >= 1, f"Expected tool card, got: {reply_texts}"
+        final_card = tool_cards[-1]
+        assert "search" in final_card
+        assert "fetch" in final_card
+
+    @pytest.mark.asyncio
+    async def test_tools_only_no_thinking_text(self, bot):
+        """Tool calls without thinking should still create a card."""
+        reply_texts = []
+
+        async def capture_reply(msg_id, text):
+            reply_texts.append(text)
+            return f"card_{len(reply_texts)}"
+
+        bot._reply_card = AsyncMock(side_effect=capture_reply)
+
+        events = [
+            {"type": "stream_event", "event": StreamEvent(kind="tool_use", text="query",
+                                                           tool_name="search", tool_use_id="tu_1")},
+            {"type": "stream_event", "event": StreamEvent(kind="result", text="answer")},
+            {"type": "final", "result": StreamResult()},
+        ]
+
+        async def fake_stream(topic_id, text):
+            for e in events:
+                yield e
+
+        bot.bridge.stream_ask = fake_stream
+        await bot._handle("chat_1", "msg_1", "topic_1", "test")
+
+        tool_cards = [t for t in reply_texts if "Tool Calls" in t]
+        assert len(tool_cards) >= 1, "Tools without thinking should still create a card"
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Image / file sanitization for Feishu cards
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# \u2501\u2501 Image resolution tests \u2501\u2501
+
+class TestResolveImages:
+    """Test _resolve_images uploads images and replaces URLs with image_keys."""
+
+    @pytest.fixture
+    def bot(self):
+        cfg = {"app_id": "test", "app_secret": "test"}
+        bridge = MagicMock()
+        bot = FeishuBot(cfg, bridge)
+        bot._image_cache = {}
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_no_images_unchanged(self, bot):
+        text = "Just normal text with [link](https://example.com)"
+        result = await FeishuBot._resolve_images(bot, text)
+        assert result == text
+
+    @pytest.mark.asyncio
+    async def test_empty_text(self, bot):
+        assert await FeishuBot._resolve_images(bot, "") == ""
+        assert await FeishuBot._resolve_images(bot, None) is None
+
+    @pytest.mark.asyncio
+    async def test_successful_upload_replaces_url(self, bot):
+        bot._upload_image_to_feishu = AsyncMock(return_value="img_uploaded_key")
+        text = "Here is ![chart](https://example.com/chart.png) done"
+        result = await FeishuBot._resolve_images(bot, text)
+        assert "![chart](img_uploaded_key)" in result
+        assert "example.com" not in result
+
+    @pytest.mark.asyncio
+    async def test_failed_upload_leaves_url_unchanged(self, bot):
+        bot._upload_image_to_feishu = AsyncMock(return_value=None)
+        text = "Here is ![chart](https://example.com/chart.png) done"
+        result = await FeishuBot._resolve_images(bot, text)
+        assert "![chart](https://example.com/chart.png)" in result
+
+    @pytest.mark.asyncio
+    async def test_multiple_images_partial_upload(self, bot):
+        async def selective_upload(url):
+            if "good" in url:
+                return "img_good_key"
+            return None
+
+        bot._upload_image_to_feishu = AsyncMock(side_effect=selective_upload)
+        text = "![a](https://good.com/a.png) and ![b](https://bad.com/b.png)"
+        result = await FeishuBot._resolve_images(bot, text)
+        assert "![a](img_good_key)" in result
+        assert "![b](https://bad.com/b.png)" in result
+
+
+# \u2501\u2501 Inbound message handling tests \u2501\u2501
+
+class TestExtractText:
+    """Test _extract_text handles various message formats."""
+
+    def test_plain_text(self):
+        assert FeishuBot._extract_text({"text": "hello"}) == "hello"
+
+    def test_rich_text(self):
+        content = {
+            "content": [
+                [{"tag": "text", "text": "hello"}, {"tag": "text", "text": " world"}]
+            ]
+        }
+        result = FeishuBot._extract_text(content)
+        assert "hello" in result
+        assert "world" in result
+
+    def test_empty_content(self):
+        assert FeishuBot._extract_text({}) == ""
 
 
 class TestSanitizeForCard:

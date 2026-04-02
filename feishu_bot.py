@@ -10,11 +10,13 @@ Extracted from gateway.py for architectural symmetry with WeixinBot.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import re
 import threading
 import time
+import urllib.request
 from typing import Any
 
 from gateway import ClaudeCodeBridge, StreamResult, StreamEvent, UsageSummary, _preview_text
@@ -42,14 +44,18 @@ class FeishuBot:
         self._ws_thread: threading.Thread | None = None
         self._sdk: dict[str, Any] = {}
         self._seen_msgs: set[str] = set()  # msg_id dedup
+        self._image_cache: dict[str, str | None] = {}  # url -> image_key cache
 
     async def start(self) -> None:
         """Initialize API client and start WebSocket listener."""
         import lark_oapi as lark
         from lark_oapi.api.im.v1 import (
+            CreateImageRequest,
+            CreateImageRequestBody,
             CreateMessageReactionRequest,
             CreateMessageReactionRequestBody,
             Emoji,
+            GetImageRequest,
             PatchMessageRequest,
             PatchMessageRequestBody,
             ReplyMessageRequest,
@@ -67,6 +73,9 @@ class FeishuBot:
             "PatchBody": PatchMessageRequestBody,
             "ReplyReq": ReplyMessageRequest,
             "ReplyBody": ReplyMessageRequestBody,
+            "CreateImageReq": CreateImageRequest,
+            "CreateImageBody": CreateImageRequestBody,
+            "GetImageReq": GetImageRequest,
         }
 
         self._ws_thread = threading.Thread(target=self._run_ws, daemon=True)
@@ -125,10 +134,17 @@ class FeishuBot:
                     log.info("[MSG] skip stale msg=%s age=%.0fs", msg_id, age)
                     return
 
+            msg_type = getattr(msg, "message_type", "text") or "text"
             content = json.loads(msg.content)
-            text = self._extract_text(content).strip()
 
-            log.info("[MSG] chat=%s msg=%s topic=%s text=%r", chat_id, msg_id, topic_id, text[:100])
+            # Handle image messages
+            if msg_type == "image":
+                image_key = content.get("image_key", "")
+                text = f"[用户发送了一张图片 image_key={image_key}]"
+                log.info("[MSG] chat=%s msg=%s topic=%s type=image key=%s", chat_id, msg_id, topic_id, image_key)
+            else:
+                text = self._extract_text(content).strip()
+                log.info("[MSG] chat=%s msg=%s topic=%s text=%r", chat_id, msg_id, topic_id, text[:100])
 
             if not text:
                 return
@@ -144,16 +160,12 @@ class FeishuBot:
     async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
         """Full message lifecycle: react -> stream cards -> done.
 
-        Card ordering strategy:
-        We use three debounced cards that are created in strict order:
-          1. 💭 Thinking card  — created on first thinking event
-          2. 🔧 Process card   — created on first tool_use event (AFTER thinking card exists)
-          3. ✅ Result card     — created on first result event  (AFTER process card exists)
+        Card ordering strategy (2-card model):
+          1. 💭 Thinking card — thinking text + tool calls combined
+          2. ✅ Result card   — final answer
 
-        All three use the same background flusher to debounce updates, ensuring
-        that Feishu receives card creation requests in the correct chronological
-        order. Tool calls are accumulated into a single process card rather than
-        creating separate cards per tool call.
+        Tool calls are appended to the thinking card rather than a separate
+        process card, giving the user a single "behind the scenes" view.
         """
         await self._react(msg_id, "OK")
         result = StreamResult()
@@ -161,15 +173,12 @@ class FeishuBot:
         streamed_texts: list[str] = []
         saw_stream_event = False
 
-        # --- Streaming card state (3 ordered cards) ---
+        # --- Streaming card state (2 ordered cards) ---
         _thinking_card_id: str | None = None
-        _thinking_acc: list[str] = []
-        _thinking_dirty = False
-
-        _process_card_id: str | None = None
-        _process_blocks: list[str] = []       # formatted tool blocks in order
-        _process_dirty = False
-        _tool_block_index: dict[str, int] = {}  # tool_use_id -> index in _process_blocks
+        _thinking_acc: list[str] = []       # thinking text chunks
+        _tool_blocks: list[str] = []        # formatted tool blocks
+        _tool_block_index: dict[str, int] = {}  # tool_use_id -> index in _tool_blocks
+        _thinking_dirty = False             # covers both thinking and tool updates
 
         _result_card_id: str | None = None
         _result_acc: list[str] = []
@@ -177,46 +186,48 @@ class FeishuBot:
 
         _FLUSH_INTERVAL = 0.5  # seconds between card updates
 
-        # --- Ensure card creation order ---
-        # We must create cards in order: thinking -> process -> result.
-        # If a later card needs creation but an earlier one hasn't been created yet,
-        # we force-create the earlier one first.
+        def _build_thinking_content() -> str:
+            """Build combined thinking + tool calls card content."""
+            sections: list[str] = []
+            if _thinking_acc:
+                sections.append("💭 **Thinking...**\n\n" + "".join(_thinking_acc))
+            if _tool_blocks:
+                n = len(_tool_blocks)
+                header = f"**🔧 Tool Calls ({n})**"
+                body = "\n\n---\n\n".join(_tool_blocks)
+                sections.append(f"{header}\n\n{body}")
+            content = "\n\n---\n\n".join(sections)
+            if len(content) > cls.MAX_REPLY:
+                content = content[:cls.MAX_REPLY] + "\n\n... (truncated)"
+            return content
+
+        cls = self.__class__
 
         async def _ensure_thinking_card():
             """Ensure thinking card exists (create if needed)."""
             nonlocal _thinking_card_id
-            if _thinking_card_id is None and _thinking_acc:
-                full = "💭 **Thinking...**\n\n" + "".join(_thinking_acc)
-                _thinking_card_id = await self._reply_card(msg_id, full)
-
-        async def _ensure_process_card():
-            """Ensure process card exists, creating thinking card first if needed."""
-            nonlocal _process_card_id
-            if _process_card_id is None and _process_blocks:
-                await _ensure_thinking_card()
-                content = self._build_process_card(_process_blocks)
-                _process_card_id = await self._reply_card(msg_id, content)
+            if _thinking_card_id is None and (_thinking_acc or _tool_blocks):
+                _thinking_card_id = await self._reply_card(msg_id, _build_thinking_content())
 
         async def _ensure_result_card():
-            """Ensure result card exists, creating earlier cards first if needed."""
+            """Ensure result card exists, creating thinking card first if needed."""
             nonlocal _result_card_id
             if _result_card_id is None and _result_acc:
                 await _ensure_thinking_card()
-                await _ensure_process_card()
                 full = "".join(_result_acc)
                 _result_card_id = await self._reply_card(msg_id, full)
 
         async def _flush_cards():
             """Background flusher: periodically update cards with accumulated text."""
-            nonlocal _thinking_dirty, _process_dirty, _result_dirty
-            nonlocal _thinking_card_id, _process_card_id, _result_card_id
+            nonlocal _thinking_dirty, _result_dirty
+            nonlocal _thinking_card_id, _result_card_id
             while True:
                 await asyncio.sleep(_FLUSH_INTERVAL)
 
-                # Flush thinking card
-                if _thinking_dirty and _thinking_acc:
+                # Flush thinking card (includes tool calls)
+                if _thinking_dirty and (_thinking_acc or _tool_blocks):
                     _thinking_dirty = False
-                    full = "💭 **Thinking...**\n\n" + "".join(_thinking_acc)
+                    full = _build_thinking_content()
                     if _thinking_card_id:
                         try:
                             await self._update_card(_thinking_card_id, full)
@@ -225,26 +236,10 @@ class FeishuBot:
                     else:
                         _thinking_card_id = await self._reply_card(msg_id, full)
 
-                # Flush process card (tool calls)
-                if _process_dirty and _process_blocks:
-                    _process_dirty = False
-                    # Ensure thinking card is created first (ordering guarantee)
-                    await _ensure_thinking_card()
-                    content = self._build_process_card(_process_blocks)
-                    if _process_card_id:
-                        try:
-                            await self._update_card(_process_card_id, content)
-                        except Exception:
-                            log.debug("flush process card update failed")
-                    else:
-                        _process_card_id = await self._reply_card(msg_id, content)
-
                 # Flush result card
                 if _result_dirty and _result_acc:
                     _result_dirty = False
-                    # Ensure earlier cards are created first (ordering guarantee)
                     await _ensure_thinking_card()
-                    await _ensure_process_card()
                     full = "".join(_result_acc)
                     if _result_card_id:
                         try:
@@ -281,15 +276,15 @@ class FeishuBot:
                         _result_dirty = True
                         continue
 
-                    # -- Tool use: add block to process card --
+                    # -- Tool use: add block to thinking card --
                     if stream_event.kind == "tool_use":
                         block = self._format_stream_event(stream_event)
                         if block:
-                            idx = len(_process_blocks)
-                            _process_blocks.append(block)
+                            idx = len(_tool_blocks)
+                            _tool_blocks.append(block)
                             if stream_event.tool_use_id:
                                 _tool_block_index[stream_event.tool_use_id] = idx
-                            _process_dirty = True
+                            _thinking_dirty = True
                             log.info(
                                 "[RenderProcess] action=add_tool_use tool=%s id=%s block_idx=%d",
                                 stream_event.tool_name or "-",
@@ -298,15 +293,15 @@ class FeishuBot:
                             )
                         continue
 
-                    # -- Tool result: merge into existing tool block in process card --
+                    # -- Tool result: merge into existing tool block in thinking card --
                     if stream_event.kind == "tool_result":
                         if stream_event.tool_use_id and stream_event.tool_use_id in _tool_block_index:
                             idx = _tool_block_index[stream_event.tool_use_id]
-                            old_block = _process_blocks[idx]
+                            old_block = _tool_blocks[idx]
                             merged = self._merge_tool_stream_blocks(old_block, stream_event)
                             if merged and merged != old_block:
-                                _process_blocks[idx] = merged
-                                _process_dirty = True
+                                _tool_blocks[idx] = merged
+                                _thinking_dirty = True
                                 log.info(
                                     "[RenderProcess] action=merge_tool_result tool=%s id=%s block_idx=%d",
                                     stream_event.tool_name or "-",
@@ -317,8 +312,8 @@ class FeishuBot:
                             # Unbound tool result — add as standalone block
                             block = self._format_stream_event(stream_event)
                             if block:
-                                _process_blocks.append(block)
-                                _process_dirty = True
+                                _tool_blocks.append(block)
+                                _thinking_dirty = True
                                 log.info(
                                     "[RenderProcess] action=add_unbound_tool_result tool=%s id=%s",
                                     stream_event.tool_name or "-",
@@ -364,9 +359,10 @@ class FeishuBot:
             pass
 
         # -- Final flush -- ensure all accumulated content is displayed --
-        # Order matters: thinking -> process -> result
-        if _thinking_acc:
-            full = "💭 **Thinking**\n\n" + "".join(_thinking_acc)
+        # Order matters: thinking (with tools) -> result
+        if _thinking_acc or _tool_blocks:
+            # Change header from "Thinking..." to "Thinking" for final state
+            full = _build_thinking_content().replace("Thinking...", "Thinking", 1)
             if _thinking_card_id:
                 try:
                     await self._update_card(_thinking_card_id, full)
@@ -374,20 +370,6 @@ class FeishuBot:
                     pass
             else:
                 _thinking_card_id = await self._reply_card(msg_id, full)
-
-        if _process_blocks:
-            content = self._build_process_card(_process_blocks)
-            if _process_card_id:
-                try:
-                    await self._update_card(_process_card_id, content)
-                except Exception:
-                    pass
-            else:
-                # Ensure thinking card exists before creating process card
-                if _thinking_acc and not _thinking_card_id:
-                    full = "💭 **Thinking**\n\n" + "".join(_thinking_acc)
-                    _thinking_card_id = await self._reply_card(msg_id, full)
-                _process_card_id = await self._reply_card(msg_id, content)
 
         if _result_acc:
             full = "".join(_result_acc)
@@ -403,10 +385,8 @@ class FeishuBot:
                     except Exception:
                         log.error("[FinalFlush] retry update result card %s also failed", _result_card_id)
             elif full.strip():
-                # Ensure earlier cards exist before creating result card
-                if _thinking_acc and not _thinking_card_id:
-                    pass  # Already handled above
-                if _process_blocks and not _process_card_id:
+                # Ensure thinking card exists before creating result card
+                if (_thinking_acc or _tool_blocks) and not _thinking_card_id:
                     pass  # Already handled above
                 card_id = await self._reply_card(msg_id, full)
                 if card_id is None and full.strip():
@@ -610,6 +590,7 @@ class FeishuBot:
 
     async def _reply_card(self, msg_id: str, text: str) -> str | None:
         try:
+            text = await self._resolve_images(text)
             req = (
                 self._sdk["ReplyReq"]
                 .builder()
@@ -648,6 +629,7 @@ class FeishuBot:
 
     async def _update_card(self, card_id: str, text: str) -> None:
         try:
+            text = await self._resolve_images(text)
             req = (
                 self._sdk["PatchReq"]
                 .builder()
@@ -666,6 +648,82 @@ class FeishuBot:
                 )
         except Exception:
             log.exception("Update card failed for %s (text_len=%d)", card_id, len(text))
+
+    # ── Image upload / resolution ──────────────────────────────────
+
+    async def _upload_image_to_feishu(self, url: str) -> str | None:
+        """Download image from URL and upload to Feishu. Returns image_key or None."""
+        if url in self._image_cache:
+            return self._image_cache[url]
+        try:
+            req_ = urllib.request.Request(url, headers={"User-Agent": "DeerFlow/1.0"})
+            data = await asyncio.to_thread(
+                lambda: urllib.request.urlopen(req_, timeout=10).read()
+            )
+            if not data or len(data) < 100:  # skip tiny / empty responses
+                self._image_cache[url] = None
+                return None
+
+            body = (
+                self._sdk["CreateImageBody"]
+                .builder()
+                .image_type("message")
+                .image(io.BytesIO(data))
+                .build()
+            )
+            req = self._sdk["CreateImageReq"].builder().request_body(body).build()
+            resp = await asyncio.to_thread(self._api_client.im.v1.image.create, req)
+            code = getattr(resp, "code", None)
+            if code == 0 and resp.data:
+                key = resp.data.image_key
+                log.info("[ImageUpload] ok url=%s key=%s size=%d", url[:80], key, len(data))
+                self._image_cache[url] = key
+                return key
+            else:
+                log.warning("[ImageUpload] API error url=%s code=%s", url[:80], code)
+        except Exception:
+            log.debug("[ImageUpload] failed url=%s", url[:80], exc_info=True)
+        self._image_cache[url] = None
+        return None
+
+    async def _resolve_images(self, text: str) -> str:
+        """Try to upload images in text to Feishu, replacing URLs with image_keys.
+
+        Successfully uploaded images become inline Feishu images.
+        Failed uploads are left unchanged — _sanitize_for_card() converts them
+        to plain links as a safety net.
+        """
+        if not text:
+            return text
+        matches = list(self._RE_MD_IMAGE.finditer(text))
+        if not matches:
+            return text
+
+        # Collect unique URLs
+        urls = list({m.group(2) for m in matches})
+
+        # Upload concurrently (with short timeout per image)
+        results = await asyncio.gather(
+            *(self._upload_image_to_feishu(u) for u in urls),
+            return_exceptions=True,
+        )
+        url_to_key: dict[str, str] = {}
+        for url, res in zip(urls, results):
+            if isinstance(res, str) and res:
+                url_to_key[url] = res
+
+        if not url_to_key:
+            return text  # no successful uploads
+
+        # Replace URLs with image_keys for successful uploads
+        def _replacer(m: re.Match) -> str:
+            alt = m.group(1)
+            url = m.group(2)
+            if url in url_to_key:
+                return f"![{alt}]({url_to_key[url]})"
+            return m.group(0)  # leave unchanged
+
+        return self._RE_MD_IMAGE.sub(_replacer, text)
 
     # ── Regex patterns for card content sanitization ──────────────
     # Markdown image: ![alt](url) or ![alt](url "title")
