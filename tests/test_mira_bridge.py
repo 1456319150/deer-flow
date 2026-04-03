@@ -205,7 +205,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_normal_flow_streaming_deltas(self, bridge):
         """Verify thinking + text deltas → individual stream events."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # Thinking block
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="thinking", data_type="stream_event")
@@ -270,7 +270,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_no_thinking(self, bridge):
         """When no thinking block, only result events emitted."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="text", data_type="stream_event")
             yield _make_event("reason", text="Direct answer",
@@ -293,7 +293,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_thinking_only_no_text_block(self, bridge):
         """Thinking-only response (no text block) falls back to content."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="thinking", data_type="stream_event")
             yield _make_event("reason", text="Deep thought",
@@ -317,7 +317,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_title_event_ignored(self, bridge):
         """Title events should be logged but not yielded."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("title", text="Conversation Title")
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="text", data_type="stream_event")
@@ -340,7 +340,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_content_fallback_when_no_stream_deltas(self, bridge):
         """When no reason stream deltas arrive, content event is used as fallback."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("content", data={"content": {"result": "fallback answer"}})
 
         bridge._sessions["t1"] = "existing_session"
@@ -355,7 +355,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_multiple_thinking_chunks_streamed_individually(self, bridge):
         """Each thinking delta is yielded as a separate stream event."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="thinking", data_type="stream_event")
             for i in range(5):
@@ -388,7 +388,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_legacy_reason_without_inner_type(self, bridge):
         """Reason events without inner_type (legacy format) use direct text."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", text="legacy text", data_type="stream_event")
             yield _make_event("content", data={"content": {"result": "legacy text"}})
 
@@ -406,7 +406,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_assistant_type_skipped(self, bridge):
         """Assistant-type reason events (accumulated snapshots) are skipped."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # Stream delta (should be kept)
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="text", data_type="stream_event")
@@ -433,7 +433,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_system_type_skipped(self, bridge):
         """System-type reason events are skipped."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", text="system init", data_type="system")
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="text", data_type="stream_event")
@@ -456,7 +456,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_safety_audit_type_skipped(self, bridge):
         """Safety audit events are skipped (recognizer_results, <cis-ctrl>)."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", text="audit data",
                               data_type="safety_audit")
             yield _make_event("reason", inner_type="content_block_start",
@@ -482,7 +482,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_user_event_yields_tool_result(self, bridge):
         """User-type reason events with tool_result content yield tool_result events."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # First, a tool_use block to register the tool name
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="tool_use", data_type="stream_event",
@@ -510,7 +510,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_user_event_no_message_structure_yields_nothing(self, bridge):
         """User-type reason events without message.content structure yield nothing."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # User event with no proper structure (just text, no message.content)
             yield _make_event("reason", text="", data_type="user")
             yield _make_event("content", data={"content": {"result": "answer"}})
@@ -528,7 +528,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_tool_use_block_yields_event_on_stop(self, bridge):
         """tool_use block: start → input_json_delta → stop → yields tool_use event."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="tool_use", data_type="stream_event",
                               tool_name="web_search", tool_use_id="toolu_123")
@@ -557,7 +557,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_input_json_delta_not_treated_as_text(self, bridge):
         """input_json_delta events are accumulated for tool input, not treated as text."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="tool_use", data_type="stream_event",
                               tool_name="calculator", tool_use_id="toolu_456")
@@ -591,7 +591,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_full_tool_use_flow(self, bridge):
         """Full flow: thinking → tool_use → tool_result → text answer."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # Thinking
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="thinking", data_type="stream_event")
@@ -676,7 +676,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_multiple_tool_calls(self, bridge):
         """Multiple tool_use blocks each produce their own tool_use event."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # First tool
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="tool_use", data_type="stream_event",
@@ -735,7 +735,7 @@ class TestStreamAskEventMapping:
     @pytest.mark.asyncio
     async def test_no_thinking_status_for_tool_phase(self, bridge):
         """Tool_use blocks produce tool_use events, not a thinking 'researching' status."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="tool_use", data_type="stream_event",
                               tool_name="web_search", tool_use_id="toolu_001")
@@ -769,7 +769,7 @@ class TestStreamAskSessionCreation:
     @pytest.mark.asyncio
     async def test_auto_creates_session(self, bridge):
         """When no session exists for topic, should auto-create one."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("content", text="response",
                              data={"content": {"result": "response"}})
 
@@ -816,7 +816,7 @@ class TestStreamAskErrors:
     @pytest.mark.asyncio
     async def test_auth_error_during_chat(self, bridge):
         """Auth error during chat stream → error in final result."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             raise MiraAuthError("token expired")
             yield  # make it a generator
 
@@ -830,7 +830,7 @@ class TestStreamAskErrors:
     @pytest.mark.asyncio
     async def test_generic_error_during_chat(self, bridge):
         """Generic error during chat → error in final result."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             raise RuntimeError("stream broken")
             yield
 
@@ -910,7 +910,7 @@ class TestAsk:
     @pytest.mark.asyncio
     async def test_ask_returns_result_text(self, bridge):
         """ask() consumes stream and returns final StreamResult."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="text", data_type="stream_event")
             yield _make_event("reason", text="the answer",
@@ -1064,7 +1064,7 @@ class TestAssistantSnapshotIntegration:
     async def test_tool_result_resolves_name_from_assistant_snapshot(self, bridge):
         """When tool_use only appears in assistant snapshot (no content_block_start),
         tool_result should still resolve the correct tool name."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # No content_block_start for tool_use — only assistant snapshot
             yield _make_assistant_snapshot_with_tools([
                 {"id": "toolu_bdrk_abc", "name": "mcp__proxy___mira_py__web_search",
@@ -1099,7 +1099,7 @@ class TestAssistantSnapshotIntegration:
     async def test_no_duplicate_when_content_block_and_assistant_both_present(self, bridge):
         """If content_block_stop already emitted tool_use, assistant snapshot
         should NOT emit a duplicate."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # Normal content_block_start → stop flow
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="tool_use", data_type="stream_event",
@@ -1131,7 +1131,7 @@ class TestAssistantSnapshotIntegration:
     async def test_multiple_tools_only_in_assistant_snapshots(self, bridge):
         """Simulates the user's actual failure: multiple tools only visible
         in assistant snapshots, not via content_block_start/stop."""
-        async def mock_chat(session_id, content, model=None, mode=None):
+        async def mock_chat(session_id, content, model=None, mode=None, **kwargs):
             # Thinking delta
             yield _make_event("reason", inner_type="content_block_start",
                               block_type="thinking", data_type="stream_event")

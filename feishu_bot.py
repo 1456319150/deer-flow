@@ -13,7 +13,9 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 import urllib.request
@@ -34,6 +36,8 @@ class FeishuBot:
     MAX_TOOL_OUTPUT = 1000
     MAX_TOOL_CALLS_SHOWN = 10
     MSG_MAX_AGE = 120  # Ignore messages older than 2 minutes (offline replay protection)
+
+    _INBOUND_DIR = "/tmp/deerflow_inbound"
 
     def __init__(self, cfg: dict, bridge: ClaudeCodeBridge):
         self.app_id: str = cfg["app_id"]
@@ -56,6 +60,7 @@ class FeishuBot:
             CreateMessageReactionRequestBody,
             Emoji,
             GetImageRequest,
+            GetMessageResourceRequest,
             PatchMessageRequest,
             PatchMessageRequestBody,
             ReplyMessageRequest,
@@ -76,6 +81,7 @@ class FeishuBot:
             "CreateImageReq": CreateImageRequest,
             "CreateImageBody": CreateImageRequestBody,
             "GetImageReq": GetImageRequest,
+            "GetMsgResourceReq": GetMessageResourceRequest,
         }
 
         self._ws_thread = threading.Thread(target=self._run_ws, daemon=True)
@@ -108,6 +114,65 @@ class FeishuBot:
         except Exception:
             log.exception("Feishu WebSocket error")
 
+    # --- Inbound attachment helpers ---
+
+    async def _download_feishu_image(self, image_key: str) -> bytes | None:
+        """Download an image from Feishu by image_key."""
+        try:
+            req = self._sdk["GetImageReq"].builder().image_key(image_key).build()
+            resp = await asyncio.to_thread(self._api_client.im.v1.image.get, req)
+            if getattr(resp, "code", None) == 0 and resp.file:
+                data = resp.file.read()
+                log.info("[ImageDownload] ok key=%s size=%d", image_key, len(data))
+                return data
+            log.warning("[ImageDownload] API error key=%s code=%s", image_key, getattr(resp, "code", "?"))
+        except Exception:
+            log.warning("[ImageDownload] failed key=%s", image_key, exc_info=True)
+        return None
+
+    async def _download_feishu_file(self, msg_id: str, file_key: str, file_type: str = "file") -> bytes | None:
+        """Download a file attachment from Feishu by file_key."""
+        try:
+            req = (
+                self._sdk["GetMsgResourceReq"]
+                .builder()
+                .message_id(msg_id)
+                .file_key(file_key)
+                .type(file_type)
+                .build()
+            )
+            resp = await asyncio.to_thread(self._api_client.im.v1.message_resource.get, req)
+            if getattr(resp, "code", None) == 0 and resp.file:
+                data = resp.file.read()
+                log.info("[FileDownload] ok key=%s size=%d", file_key, len(data))
+                return data
+            log.warning("[FileDownload] API error key=%s code=%s", file_key, getattr(resp, "code", "?"))
+        except Exception:
+            log.warning("[FileDownload] failed key=%s", file_key, exc_info=True)
+        return None
+
+    @staticmethod
+    def _guess_image_ext(data: bytes) -> str:
+        """Guess image extension from magic bytes."""
+        if data[:8] == b'\x89PNG\r\n\x1a\n':
+            return ".png"
+        if data[:2] == b'\xff\xd8':
+            return ".jpg"
+        if data[:4] == b'GIF8':
+            return ".gif"
+        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            return ".webp"
+        return ".bin"
+
+    @staticmethod
+    def _cleanup_inbound_attachments(paths: list[str]) -> None:
+        """Remove temporary inbound attachment files."""
+        for p in paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
     def _on_message(self, event: Any) -> None:
         """Handle incoming message (runs in lark thread)."""
         try:
@@ -137,27 +202,47 @@ class FeishuBot:
             msg_type = getattr(msg, "message_type", "text") or "text"
             content = json.loads(msg.content)
 
-            # Handle image messages
+            # --- Build attachment metadata ---
+            attachment_meta: list[dict[str, str]] = []
+
             if msg_type == "image":
                 image_key = content.get("image_key", "")
-                text = f"[用户发送了一张图片 image_key={image_key}]"
+                if image_key:
+                    attachment_meta.append({"type": "image", "key": image_key, "name": ""})
+                text = ""  # image-only message, no text
                 log.info("[MSG] chat=%s msg=%s topic=%s type=image key=%s", chat_id, msg_id, topic_id, image_key)
+            elif msg_type == "file":
+                file_key = content.get("file_key", "")
+                file_name = content.get("file_name", "attachment")
+                if file_key:
+                    attachment_meta.append({"type": "file", "key": file_key, "name": file_name, "msg_id": msg_id})
+                text = ""
+                log.info("[MSG] chat=%s msg=%s topic=%s type=file key=%s name=%s", chat_id, msg_id, topic_id, file_key, file_name)
+            elif msg_type in ("audio", "video", "media"):
+                text = f"[不支持的消息类型: {msg_type}，请发送文字、图片或文件]"
+                log.info("[MSG] chat=%s msg=%s topic=%s type=%s (unsupported)", chat_id, msg_id, topic_id, msg_type)
             else:
                 text = self._extract_text(content).strip()
                 log.info("[MSG] chat=%s msg=%s topic=%s text=%r", chat_id, msg_id, topic_id, text[:100])
+
+            # For image/file-only messages, provide a description as prompt
+            if not text and attachment_meta:
+                types = [a["type"] for a in attachment_meta]
+                names = [a.get("name") or a["key"] for a in attachment_meta]
+                text = f"[用户发送了附件: {', '.join(names)}]"
 
             if not text:
                 return
 
             if self._main_loop and self._main_loop.is_running():
                 fut = asyncio.run_coroutine_threadsafe(
-                    self._handle(chat_id, msg_id, topic_id, text), self._main_loop
+                    self._handle(chat_id, msg_id, topic_id, text, attachment_meta=attachment_meta or None), self._main_loop
                 )
                 fut.add_done_callback(lambda f, mid=msg_id: self._log_err(f, mid))
         except Exception:
             log.exception("Error processing message")
 
-    async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str) -> None:
+    async def _handle(self, chat_id: str, msg_id: str, topic_id: str, text: str, attachment_meta: list[dict[str, str]] | None = None) -> None:
         """Full message lifecycle: react -> stream cards -> done.
 
         Card ordering strategy (2-card model):
@@ -168,6 +253,37 @@ class FeishuBot:
         process card, giving the user a single "behind the scenes" view.
         """
         await self._react(msg_id, "OK")
+
+        # --- Download inbound attachments to temp files ---
+        image_paths: list[str] = []
+        file_paths: list[str] = []
+        all_temp_paths: list[str] = []
+
+        if attachment_meta:
+            os.makedirs(self._INBOUND_DIR, exist_ok=True)
+            for att in attachment_meta:
+                if att["type"] == "image":
+                    data = await self._download_feishu_image(att["key"])
+                    if data:
+                        ext = self._guess_image_ext(data)
+                        path = os.path.join(self._INBOUND_DIR, f"{att['key']}{ext}")
+                        with open(path, "wb") as f:
+                            f.write(data)
+                        image_paths.append(path)
+                        all_temp_paths.append(path)
+                        log.info("[Inbound] saved image %s (%d bytes)", path, len(data))
+                elif att["type"] == "file":
+                    att_msg_id = att.get("msg_id", msg_id)
+                    data = await self._download_feishu_file(att_msg_id, att["key"])
+                    if data:
+                        safe_name = att.get("name", att["key"]).replace("/", "_").replace("..", "_")
+                        path = os.path.join(self._INBOUND_DIR, f"{att['key']}_{safe_name}")
+                        with open(path, "wb") as f:
+                            f.write(data)
+                        file_paths.append(path)
+                        all_temp_paths.append(path)
+                        log.info("[Inbound] saved file %s (%d bytes)", path, len(data))
+
         result = StreamResult()
         emitted_event_keys: set[tuple[str, str]] = set()
         streamed_texts: list[str] = []
@@ -252,7 +368,7 @@ class FeishuBot:
         flush_task = asyncio.create_task(_flush_cards())
 
         try:
-            async for event in self.bridge.stream_ask(topic_id, text):
+            async for event in self.bridge.stream_ask(topic_id, text, image_paths=image_paths or None, file_paths=file_paths or None):
                 if event["type"] == "stream_event":
                     saw_stream_event = True
                     stream_event = event["event"]
@@ -419,6 +535,10 @@ class FeishuBot:
                 log.exception("Reply usage card failed for %s", msg_id)
 
         await self._react(msg_id, "DONE")
+
+        # Clean up temp files
+        if all_temp_paths:
+            self._cleanup_inbound_attachments(all_temp_paths)
 
     @staticmethod
     def _event_dedup_key(event: StreamEvent) -> tuple[str, str] | None:

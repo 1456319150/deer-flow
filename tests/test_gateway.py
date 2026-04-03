@@ -755,7 +755,7 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
-        async def fake_stream_ask(topic_id, prompt):
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
             yield {"type": "stream_event", "event": StreamEvent(kind="thinking", text="先思考")}
             yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Bash", tool_use_id="t1", text="pwd")}
             yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Bash", tool_use_id="t1", text="/repo")}
@@ -790,7 +790,7 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
-        async def fake_stream_ask(topic_id, prompt):
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
             yield {"type": "stream_event", "event": StreamEvent(kind="text", text="同一段回复")}
             yield {"type": "stream_event", "event": StreamEvent(kind="result", text="同一段回复")}
             yield {"type": "final", "result": StreamResult(assistant_texts=["同一段回复"], result_text="同一段回复")}
@@ -815,7 +815,7 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
-        async def fake_stream_ask(topic_id, prompt):
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
             yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Read", tool_use_id="t1", text="/tmp/a.py")}
             yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Read", tool_use_id="t1", text="first")}
             yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Read", tool_use_id="t2", text="/tmp/a.py")}
@@ -853,7 +853,7 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
-        async def fake_stream_ask(topic_id, prompt):
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
             yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Bash", tool_use_id="t1", text="git status")}
             yield {"type": "stream_event", "event": StreamEvent(kind="tool_result", tool_name="Bash", tool_use_id="t1", text="working tree clean")}
             yield {"type": "final", "result": StreamResult(tool_calls=[
@@ -883,7 +883,7 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
-        async def fake_stream_ask(topic_id, prompt):
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
             yield {"type": "stream_event", "event": StreamEvent(kind="tool_use", tool_name="Bash", text="git push origin main")}
             yield {"type": "final", "result": StreamResult(assistant_texts=["已推送到 origin/main"])}
 
@@ -905,7 +905,7 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
-        async def fake_stream_ask(topic_id, prompt):
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
             yield {"type": "final", "result": StreamResult(tool_calls=[ToolCall(name="Bash", input_text="pwd")])}
 
         bot.bridge.stream_ask = fake_stream_ask
@@ -921,7 +921,7 @@ class TestFeishuStreaming(unittest.IsolatedAsyncioTestCase):
         bridge = ClaudeCodeBridge({})
         bot = FeishuBot({"app_id": "app", "app_secret": "secret"}, bridge)
 
-        async def fake_stream_ask(topic_id, prompt):
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
             yield {
                 "type": "final",
                 "result": StreamResult(
@@ -1600,7 +1600,7 @@ class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
         bridge = self._make_bridge()
         call_count = 0
 
-        async def fake_once(topic_id, prompt):
+        async def fake_once(topic_id, prompt, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1649,7 +1649,7 @@ class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
         bridge = self._make_bridge()
         call_count = 0
 
-        async def fake_once(topic_id, prompt):
+        async def fake_once(topic_id, prompt, **kwargs):
             nonlocal call_count
             call_count += 1
             yield {
@@ -1674,7 +1674,7 @@ class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
         bridge = self._make_bridge()
         call_count = 0
 
-        async def fake_once(topic_id, prompt):
+        async def fake_once(topic_id, prompt, **kwargs):
             nonlocal call_count
             call_count += 1
             yield {
@@ -1700,7 +1700,7 @@ class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
         bridge = self._make_bridge()
         call_count = 0
 
-        async def fake_once(topic_id, prompt):
+        async def fake_once(topic_id, prompt, **kwargs):
             nonlocal call_count
             call_count += 1
             yield {
@@ -1728,7 +1728,7 @@ class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
         bridge = self._make_bridge()
         call_count = 0
 
-        async def fake_once(topic_id, prompt):
+        async def fake_once(topic_id, prompt, **kwargs):
             nonlocal call_count
             call_count += 1
             yield {
@@ -1753,7 +1753,7 @@ class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
         bridge = self._make_bridge()
         prompts_received = []
 
-        async def fake_once(topic_id, prompt):
+        async def fake_once(topic_id, prompt, **kwargs):
             prompts_received.append(prompt)
             if len(prompts_received) == 1:
                 yield {
@@ -1786,7 +1786,7 @@ class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
         bridge = self._make_bridge()
         call_count = 0
 
-        async def fake_once(topic_id, prompt):
+        async def fake_once(topic_id, prompt, **kwargs):
             nonlocal call_count
             call_count += 1
             yield {

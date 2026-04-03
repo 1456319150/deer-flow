@@ -67,16 +67,16 @@ class MiraBridge:
 
     # ── Primary interface (matches ClaudeCodeBridge) ───────────────
 
-    async def ask(self, topic_id: str, prompt: str) -> StreamResult:
+    async def ask(self, topic_id: str, prompt: str, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> StreamResult:
         """Send prompt to Mira, return structured StreamResult."""
         result: StreamResult | None = None
-        async for event in self.stream_ask(topic_id, prompt):
+        async for event in self.stream_ask(topic_id, prompt, image_paths=image_paths, file_paths=file_paths):
             if event["type"] == "final":
                 result = event["result"]
         return result or StreamResult()
 
     async def stream_ask(
-        self, topic_id: str, prompt: str
+        self, topic_id: str, prompt: str, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream Mira output, yielding gateway-compatible events.
 
@@ -119,6 +119,18 @@ class MiraBridge:
             topic_id, session_id, len(prompt),
         )
 
+        # --- Upload inbound attachments ---
+        attachments: list[dict] = []
+        if image_paths or file_paths:
+            all_paths = list(image_paths or []) + list(file_paths or [])
+            for fpath in all_paths:
+                try:
+                    file_info = await self.client.upload_file(fpath)
+                    attachments.append(file_info.to_attachment())
+                    log.info("[MiraBridge] uploaded attachment %s -> %s", fpath, file_info.url[:80])
+                except Exception:
+                    log.warning("[MiraBridge] failed to upload %s", fpath, exc_info=True)
+
         result = StreamResult()
         result.session_id = session_id
 
@@ -138,7 +150,8 @@ class MiraBridge:
 
         try:
             async for evt in self.client.chat(
-                session_id, prompt, model=self.model, mode=self.mode
+                session_id, prompt, model=self.model, mode=self.mode,
+                attachments=attachments or None,
             ):
                 if evt.event != "reason":
                     # ── content event: extract usage (text already streamed) ─

@@ -147,7 +147,7 @@ class TestCardOrderingIntegration:
             {"type": "final", "result": StreamResult()},
         ]
 
-        async def fake_stream(topic_id, text):
+        async def fake_stream(topic_id, text, **kwargs):
             for e in events:
                 yield e
 
@@ -180,7 +180,7 @@ class TestCardOrderingIntegration:
             {"type": "final", "result": StreamResult()},
         ]
 
-        async def fake_stream(topic_id, text):
+        async def fake_stream(topic_id, text, **kwargs):
             for e in events:
                 yield e
 
@@ -211,7 +211,7 @@ class TestCardOrderingIntegration:
             {"type": "final", "result": StreamResult()},
         ]
 
-        async def fake_stream(topic_id, text):
+        async def fake_stream(topic_id, text, **kwargs):
             for e in events:
                 yield e
 
@@ -242,7 +242,7 @@ class TestCardOrderingIntegration:
             {"type": "final", "result": StreamResult()},
         ]
 
-        async def fake_stream(topic_id, text):
+        async def fake_stream(topic_id, text, **kwargs):
             for e in events:
                 yield e
 

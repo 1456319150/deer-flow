@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
@@ -204,15 +205,15 @@ class ClaudeCodeBridge:
     def _retry_prompt(self, _result: StreamResult) -> str:
         return "continue"
 
-    async def ask(self, topic_id: str, prompt: str) -> StreamResult:
+    async def ask(self, topic_id: str, prompt: str, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> StreamResult:
         """Send prompt to Claude Code, return structured StreamResult."""
         result: StreamResult | None = None
-        async for event in self.stream_ask(topic_id, prompt):
+        async for event in self.stream_ask(topic_id, prompt, image_paths=image_paths, file_paths=file_paths):
             if event["type"] == "final":
                 result = event["result"]
         return result or StreamResult()
 
-    async def stream_ask(self, topic_id: str, prompt: str) -> AsyncIterator[dict[str, Any]]:
+    async def stream_ask(self, topic_id: str, prompt: str, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> AsyncIterator[dict[str, Any]]:
         """Stream Claude Code output with auto-retry on tool_use exit.
 
         When the CLI exits with stop_reason=tool_use and empty result, it means
@@ -222,7 +223,10 @@ class ClaudeCodeBridge:
         """
         for attempt in range(_MAX_TOOL_USE_RETRIES + 1):
             final_result: StreamResult | None = None
-            async for event in self._stream_ask_once(topic_id, prompt):
+            # Only pass image/file paths on first attempt
+            _img = image_paths if attempt == 0 else None
+            _fil = file_paths if attempt == 0 else None
+            async for event in self._stream_ask_once(topic_id, prompt, image_paths=_img, file_paths=_fil):
                 if event["type"] == "final":
                     final_result = event["result"]
                 else:
@@ -261,11 +265,11 @@ class ClaudeCodeBridge:
         if final_result is not None:
             yield {"type": "final", "result": final_result}
 
-    async def _stream_ask_once(self, topic_id: str, prompt: str) -> AsyncIterator[dict[str, Any]]:
+    async def _stream_ask_once(self, topic_id: str, prompt: str, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> AsyncIterator[dict[str, Any]]:
         """Single attempt: stream Claude Code output as events plus one final result."""
         session_id = self._sessions.get(topic_id)
         full_prompt = self._build_full_prompt(prompt)
-        cmd = self._build_cmd(full_prompt, session_id)
+        cmd = self._build_cmd(full_prompt, session_id, image_paths=image_paths, file_paths=file_paths)
 
         log.info("[Bridge] topic=%s session=%s prompt=%d chars", topic_id, session_id, len(prompt))
 
@@ -895,12 +899,17 @@ class ClaudeCodeBridge:
             json.dump(self._sessions, f, ensure_ascii=False, indent=2, sort_keys=True)
         os.replace(tmp_path, self.session_store_path)
 
-    def _build_cmd(self, prompt: str, session_id: str | None) -> list[str]:
+    def _build_cmd(self, prompt: str, session_id: str | None, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> list[str]:
         if self.provider == "codex":
-            return self._build_cmd_codex(prompt, session_id)
-        return self._build_cmd_claude(prompt, session_id)
+            return self._build_cmd_codex(prompt, session_id, image_paths=image_paths, file_paths=file_paths)
+        return self._build_cmd_claude(prompt, session_id, image_paths=image_paths, file_paths=file_paths)
 
-    def _build_cmd_claude(self, prompt: str, session_id: str | None) -> list[str]:
+    def _build_cmd_claude(self, prompt: str, session_id: str | None, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> list[str]:
+        # Prepend file references to prompt if files attached
+        if file_paths:
+            file_refs = "\n".join(f"[附件: {p}]" for p in file_paths)
+            prompt = f"{file_refs}\n\n{prompt}"
+
         safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
         parts = [
             f"-p {safe(prompt)}",
@@ -912,14 +921,27 @@ class ClaudeCodeBridge:
             parts.insert(0, f"--resume {session_id}")
         if self.allowed_tools:
             parts.append(f"--allowedTools {self.allowed_tools}")
+        # Add image paths for Claude vision
+        if image_paths:
+            for img_path in image_paths:
+                parts.append(f"--images {img_path}")
         return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
 
-    def _build_cmd_codex(self, prompt: str, session_id: str | None) -> list[str]:
+    def _build_cmd_codex(self, prompt: str, session_id: str | None, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> list[str]:
+        # Prepend file references to prompt if files attached
+        if file_paths:
+            file_refs = "\n".join(f"[附件: {p}]" for p in file_paths)
+            prompt = f"{file_refs}\n\n{prompt}"
+
         safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
         if session_id:
             parts = ["exec", "--yolo", "--json", "resume", session_id, safe(prompt)]
         else:
             parts = ["exec", "--yolo", "--json", safe(prompt)]
+        # Add image paths for Codex vision (note: --image singular, not --images)
+        if image_paths:
+            for img_path in image_paths:
+                parts.append(f"--image {img_path}")
         return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
 
 
