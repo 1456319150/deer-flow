@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import tempfile
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -222,13 +223,13 @@ class TestBuildCmdClaudeAttachments:
     def test_single_image(self, bridge):
         cmd = bridge._build_cmd_claude("hello", None, image_paths=["/tmp/img.png"])
         args_str = cmd[-1]
-        assert "--images /tmp/img.png" in args_str
+        assert "--images '/tmp/img.png'" in args_str
 
     def test_multiple_images(self, bridge):
         cmd = bridge._build_cmd_claude("hello", None, image_paths=["/tmp/a.png", "/tmp/b.jpg"])
         args_str = cmd[-1]
-        assert "--images /tmp/a.png" in args_str
-        assert "--images /tmp/b.jpg" in args_str
+        assert "--images '/tmp/a.png'" in args_str
+        assert "--images '/tmp/b.jpg'" in args_str
 
     def test_single_file(self, bridge):
         cmd = bridge._build_cmd_claude("analyze this", None, file_paths=["/tmp/doc.pdf"])
@@ -249,14 +250,14 @@ class TestBuildCmdClaudeAttachments:
             file_paths=["/tmp/report.pdf"],
         )
         args_str = cmd[-1]
-        assert "--images /tmp/screenshot.png" in args_str
+        assert "--images '/tmp/screenshot.png'" in args_str
         assert "[附件: /tmp/report.pdf]" in args_str
 
     def test_images_with_session_resume(self, bridge):
         cmd = bridge._build_cmd_claude("hello", "session_123", image_paths=["/tmp/img.png"])
         args_str = cmd[-1]
         assert "--resume session_123" in args_str
-        assert "--images /tmp/img.png" in args_str
+        assert "--images '/tmp/img.png'" in args_str
 
     def test_none_image_paths_ignored(self, bridge):
         cmd = bridge._build_cmd_claude("hello", None, image_paths=None)
@@ -289,14 +290,14 @@ class TestBuildCmdCodexAttachments:
     def test_single_image_uses_singular_flag(self, bridge):
         cmd = bridge._build_cmd_codex("hello", None, image_paths=["/tmp/img.png"])
         args_str = cmd[-1]
-        assert "--image /tmp/img.png" in args_str
+        assert "--image '/tmp/img.png'" in args_str
         assert "--images" not in args_str
 
     def test_multiple_images(self, bridge):
         cmd = bridge._build_cmd_codex("hello", None, image_paths=["/tmp/a.png", "/tmp/b.jpg"])
         args_str = cmd[-1]
-        assert "--image /tmp/a.png" in args_str
-        assert "--image /tmp/b.jpg" in args_str
+        assert "--image '/tmp/a.png'" in args_str
+        assert "--image '/tmp/b.jpg'" in args_str
 
     def test_file_prepend(self, bridge):
         cmd = bridge._build_cmd_codex("analyze", None, file_paths=["/tmp/doc.pdf"])
@@ -307,7 +308,7 @@ class TestBuildCmdCodexAttachments:
         cmd = bridge._build_cmd_codex("hello", "sess_abc", image_paths=["/tmp/img.png"])
         args_str = cmd[-1]
         assert "resume" in args_str
-        assert "--image /tmp/img.png" in args_str
+        assert "--image '/tmp/img.png'" in args_str
 
 
 # ===========================================================================
@@ -319,13 +320,13 @@ class TestBuildCmdDispatch:
         bridge = ClaudeCodeBridge({"ttadk_cmd": "ttadk", "model": "m", "target": "claude"})
         cmd = bridge._build_cmd("hi", None, image_paths=["/tmp/x.png"])
         args_str = cmd[-1]
-        assert "--images /tmp/x.png" in args_str
+        assert "--images '/tmp/x.png'" in args_str
 
     def test_codex_provider_dispatches(self):
         bridge = ClaudeCodeBridge({"ttadk_cmd": "ttadk", "model": "m", "target": "codex", "provider": "codex"})
         cmd = bridge._build_cmd("hi", None, image_paths=["/tmp/x.png"])
         args_str = cmd[-1]
-        assert "--image /tmp/x.png" in args_str
+        assert "--image '/tmp/x.png'" in args_str
         assert "--images" not in args_str
 
 
@@ -333,15 +334,14 @@ class TestBuildCmdDispatch:
 # 7. Gateway — stream_ask only passes images on first attempt
 # ===========================================================================
 
-class TestStreamAskRetryImagePaths:
+class TestStreamAskRetryImagePaths(unittest.IsolatedAsyncioTestCase):
 
-    @pytest.fixture
-    def bridge(self):
+    def _make_bridge(self):
         cfg = {"ttadk_cmd": "echo", "model": "m", "target": "claude"}
         return ClaudeCodeBridge(cfg)
 
-    @pytest.mark.asyncio
-    async def test_images_only_on_first_attempt(self, bridge):
+    async def test_images_only_on_first_attempt(self):
+        bridge = self._make_bridge()
         call_count = 0
         received_kwargs = []
 
@@ -371,10 +371,12 @@ class TestStreamAskRetryImagePaths:
 # 8. MiraBridge — stream_ask uploads attachments
 # ===========================================================================
 
-class TestMiraBridgeAttachments:
+class TestMiraBridgeAttachments(unittest.IsolatedAsyncioTestCase):
 
-    @pytest.fixture
-    def mock_client(self):
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp()
+        self.tmp_path = Path(self._tmp_dir)
+
         client = AsyncMock()
         client.create_session = AsyncMock(return_value="session_123")
 
@@ -401,91 +403,88 @@ class TestMiraBridgeAttachments:
         mock_chat.last_attachments = None
         client.chat = mock_chat
 
-        return client
+        self.mock_client = client
 
-    @pytest.fixture
-    def bridge(self, mock_client):
         from mira_bridge import MiraBridge
         b = object.__new__(MiraBridge)
-        b.client = mock_client
+        b.client = client
         b.model = "test-model"
         b.mode = "quick"
         b.timeout = 30
         b.session_store_path = "/tmp/test-mira-sessions.json"
         b._session_lock = asyncio.Lock()
         b._sessions = {}
-        return b
+        self.bridge = b
 
-    @pytest.mark.asyncio
-    async def test_image_upload_and_pass(self, bridge, mock_client, tmp_path):
-        img_path = tmp_path / "test.png"
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    async def test_image_upload_and_pass(self):
+        img_path = self.tmp_path / "test.png"
         img_path.write_bytes(b'\x89PNG\r\n\x1a\n' + b'\x00' * 100)
 
         events = []
-        async for event in bridge.stream_ask("topic_1", "what is this?", image_paths=[str(img_path)]):
+        async for event in self.bridge.stream_ask("topic_1", "what is this?", image_paths=[str(img_path)]):
             events.append(event)
 
-        mock_client.upload_file.assert_called_once_with(str(img_path))
-        attachments = mock_client.chat.last_attachments
+        self.mock_client.upload_file.assert_called_once_with(str(img_path))
+        attachments = self.mock_client.chat.last_attachments
         assert attachments is not None
         assert len(attachments) == 1
         assert attachments[0]["file_name"] == "test.png"
 
-    @pytest.mark.asyncio
-    async def test_file_upload_and_pass(self, bridge, mock_client, tmp_path):
-        doc_path = tmp_path / "report.pdf"
+    async def test_file_upload_and_pass(self):
+        doc_path = self.tmp_path / "report.pdf"
         doc_path.write_bytes(b'%PDF-1.4 fake content')
 
         events = []
-        async for event in bridge.stream_ask("topic_1", "summarize", file_paths=[str(doc_path)]):
+        async for event in self.bridge.stream_ask("topic_1", "summarize", file_paths=[str(doc_path)]):
             events.append(event)
 
-        mock_client.upload_file.assert_called_once_with(str(doc_path))
-        attachments = mock_client.chat.last_attachments
+        self.mock_client.upload_file.assert_called_once_with(str(doc_path))
+        attachments = self.mock_client.chat.last_attachments
         assert attachments is not None
         assert len(attachments) == 1
         assert attachments[0]["file_name"] == "report.pdf"
 
-    @pytest.mark.asyncio
-    async def test_mixed_uploads(self, bridge, mock_client, tmp_path):
-        img = tmp_path / "photo.jpg"
-        doc = tmp_path / "data.csv"
+    async def test_mixed_uploads(self):
+        img = self.tmp_path / "photo.jpg"
+        doc = self.tmp_path / "data.csv"
         img.write_bytes(b'\xff\xd8\xff\xe0' + b'\x00' * 50)
         doc.write_bytes(b'a,b,c\n1,2,3')
 
         events = []
-        async for event in bridge.stream_ask(
+        async for event in self.bridge.stream_ask(
             "topic_1", "analyze", image_paths=[str(img)], file_paths=[str(doc)]
         ):
             events.append(event)
 
-        assert mock_client.upload_file.call_count == 2
-        attachments = mock_client.chat.last_attachments
+        assert self.mock_client.upload_file.call_count == 2
+        attachments = self.mock_client.chat.last_attachments
         assert len(attachments) == 2
 
-    @pytest.mark.asyncio
-    async def test_no_attachments_passes_none(self, bridge, mock_client):
+    async def test_no_attachments_passes_none(self):
         events = []
-        async for event in bridge.stream_ask("topic_1", "just text"):
+        async for event in self.bridge.stream_ask("topic_1", "just text"):
             events.append(event)
 
-        attachments = mock_client.chat.last_attachments
+        attachments = self.mock_client.chat.last_attachments
         assert attachments is None
 
-    @pytest.mark.asyncio
-    async def test_upload_failure_graceful(self, bridge, mock_client, tmp_path):
-        mock_client.upload_file = AsyncMock(side_effect=Exception("upload failed"))
+    async def test_upload_failure_graceful(self):
+        self.mock_client.upload_file = AsyncMock(side_effect=Exception("upload failed"))
 
-        img = tmp_path / "bad.png"
+        img = self.tmp_path / "bad.png"
         img.write_bytes(b'\x89PNG' + b'\x00' * 50)
 
         events = []
-        async for event in bridge.stream_ask("topic_1", "try this", image_paths=[str(img)]):
+        async for event in self.bridge.stream_ask("topic_1", "try this", image_paths=[str(img)]):
             events.append(event)
 
         final_events = [e for e in events if e["type"] == "final"]
         assert len(final_events) == 1
-        attachments = mock_client.chat.last_attachments
+        attachments = self.mock_client.chat.last_attachments
         assert attachments is None
 
 
@@ -579,7 +578,7 @@ class TestEdgeCases:
         bridge = ClaudeCodeBridge({"ttadk_cmd": "ttadk", "model": "m", "target": "codex", "provider": "codex"})
         cmd = bridge._build_cmd_codex("hi", None, image_paths=["/tmp/my image.png"])
         args_str = cmd[-1]
-        assert "--image /tmp/my image.png" in args_str
+        assert "--image '/tmp/my image.png'" in args_str
 
     def test_guess_image_ext_with_gif87a(self):
         from feishu_bot import FeishuBot

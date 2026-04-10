@@ -254,7 +254,6 @@ class FeishuBot:
         """
         await self._react(msg_id, "OK")
 
-        # --- Download inbound attachments to temp files ---
         image_paths: list[str] = []
         file_paths: list[str] = []
         all_temp_paths: list[str] = []
@@ -284,261 +283,261 @@ class FeishuBot:
                         all_temp_paths.append(path)
                         log.info("[Inbound] saved file %s (%d bytes)", path, len(data))
 
-        result = StreamResult()
-        emitted_event_keys: set[tuple[str, str]] = set()
-        streamed_texts: list[str] = []
-        saw_stream_event = False
+        try:
+            result = StreamResult()
+            emitted_event_keys: set[tuple[str, str]] = set()
+            streamed_texts: list[str] = []
+            saw_stream_event = False
 
-        # --- Streaming card state (2 ordered cards) ---
-        _thinking_card_id: str | None = None
-        _thinking_acc: list[str] = []       # thinking text chunks
-        _tool_blocks: list[str] = []        # formatted tool blocks
-        _tool_block_index: dict[str, int] = {}  # tool_use_id -> index in _tool_blocks
-        _thinking_dirty = False             # covers both thinking and tool updates
+            # --- Streaming card state (2 ordered cards) ---
+            _thinking_card_id: str | None = None
+            _thinking_acc: list[str] = []       # thinking text chunks
+            _tool_blocks: list[str] = []        # formatted tool blocks
+            _tool_block_index: dict[str, int] = {}  # tool_use_id -> index in _tool_blocks
+            _thinking_dirty = False             # covers both thinking and tool updates
 
-        _result_card_id: str | None = None
-        _result_acc: list[str] = []
-        _result_dirty = False
+            _result_card_id: str | None = None
+            _result_acc: list[str] = []
+            _result_dirty = False
 
-        _FLUSH_INTERVAL = 0.5  # seconds between card updates
+            _FLUSH_INTERVAL = 0.5  # seconds between card updates
 
-        def _build_thinking_content() -> str:
-            """Build combined thinking + tool calls card content."""
-            sections: list[str] = []
-            if _thinking_acc:
-                sections.append("💭 **Thinking...**\n\n" + "".join(_thinking_acc))
-            if _tool_blocks:
-                n = len(_tool_blocks)
-                header = f"**🔧 Tool Calls ({n})**"
-                body = "\n\n---\n\n".join(_tool_blocks)
-                sections.append(f"{header}\n\n{body}")
-            content = "\n\n---\n\n".join(sections)
-            if len(content) > cls.MAX_REPLY:
-                content = content[:cls.MAX_REPLY] + "\n\n... (truncated)"
-            return content
+            def _build_thinking_content() -> str:
+                """Build combined thinking + tool calls card content."""
+                sections: list[str] = []
+                if _thinking_acc:
+                    sections.append("💭 **Thinking...**\n\n" + "".join(_thinking_acc))
+                if _tool_blocks:
+                    n = len(_tool_blocks)
+                    header = f"**🔧 Tool Calls ({n})**"
+                    body = "\n\n---\n\n".join(_tool_blocks)
+                    sections.append(f"{header}\n\n{body}")
+                content = "\n\n---\n\n".join(sections)
+                if len(content) > cls.MAX_REPLY:
+                    content = content[:cls.MAX_REPLY] + "\n\n... (truncated)"
+                return content
 
-        cls = self.__class__
+            cls = self.__class__
 
-        async def _ensure_thinking_card():
-            """Ensure thinking card exists (create if needed)."""
-            nonlocal _thinking_card_id
-            if _thinking_card_id is None and (_thinking_acc or _tool_blocks):
-                _thinking_card_id = await self._reply_card(msg_id, _build_thinking_content())
+            async def _ensure_thinking_card():
+                """Ensure thinking card exists (create if needed)."""
+                nonlocal _thinking_card_id
+                if _thinking_card_id is None and (_thinking_acc or _tool_blocks):
+                    _thinking_card_id = await self._reply_card(msg_id, _build_thinking_content())
 
-        async def _ensure_result_card():
-            """Ensure result card exists, creating thinking card first if needed."""
-            nonlocal _result_card_id
-            if _result_card_id is None and _result_acc:
-                await _ensure_thinking_card()
-                full = "".join(_result_acc)
-                _result_card_id = await self._reply_card(msg_id, full)
-
-        async def _flush_cards():
-            """Background flusher: periodically update cards with accumulated text."""
-            nonlocal _thinking_dirty, _result_dirty
-            nonlocal _thinking_card_id, _result_card_id
-            while True:
-                await asyncio.sleep(_FLUSH_INTERVAL)
-
-                # Flush thinking card (includes tool calls)
-                if _thinking_dirty and (_thinking_acc or _tool_blocks):
-                    _thinking_dirty = False
-                    full = _build_thinking_content()
-                    if _thinking_card_id:
-                        try:
-                            await self._update_card(_thinking_card_id, full)
-                        except Exception:
-                            log.debug("flush thinking card update failed")
-                    else:
-                        _thinking_card_id = await self._reply_card(msg_id, full)
-
-                # Flush result card
-                if _result_dirty and _result_acc:
-                    _result_dirty = False
+            async def _ensure_result_card():
+                """Ensure result card exists, creating thinking card first if needed."""
+                nonlocal _result_card_id
+                if _result_card_id is None and _result_acc:
                     await _ensure_thinking_card()
                     full = "".join(_result_acc)
-                    if _result_card_id:
-                        try:
-                            await self._update_card(_result_card_id, full)
-                        except Exception:
-                            log.debug("flush result card update failed")
-                    else:
-                        _result_card_id = await self._reply_card(msg_id, full)
+                    _result_card_id = await self._reply_card(msg_id, full)
 
-        flush_task = asyncio.create_task(_flush_cards())
+            async def _flush_cards():
+                """Background flusher: periodically update cards with accumulated text."""
+                nonlocal _thinking_dirty, _result_dirty
+                nonlocal _thinking_card_id, _result_card_id
+                while True:
+                    await asyncio.sleep(_FLUSH_INTERVAL)
 
-        try:
-            async for event in self.bridge.stream_ask(topic_id, text, image_paths=image_paths or None, file_paths=file_paths or None):
-                if event["type"] == "stream_event":
-                    saw_stream_event = True
-                    stream_event = event["event"]
-                    log.info(
-                        "[RenderEvent] kind=%s tool=%s text_len=%d preview=%r",
-                        stream_event.kind,
-                        stream_event.tool_name or "-",
-                        len(stream_event.text),
-                        _preview_text(stream_event.text),
-                    )
-
-                    # -- Thinking: accumulate into thinking card --
-                    if stream_event.kind == "thinking" and stream_event.text:
-                        _thinking_acc.append(stream_event.text)
-                        _thinking_dirty = True
-                        continue
-
-                    # -- Result: accumulate into result card --
-                    if stream_event.kind == "result" and stream_event.text:
-                        _result_acc.append(stream_event.text)
-                        _result_dirty = True
-                        continue
-
-                    # -- Tool use: add block to thinking card --
-                    if stream_event.kind == "tool_use":
-                        block = self._format_stream_event(stream_event)
-                        if block:
-                            idx = len(_tool_blocks)
-                            _tool_blocks.append(block)
-                            if stream_event.tool_use_id:
-                                _tool_block_index[stream_event.tool_use_id] = idx
-                            _thinking_dirty = True
-                            log.info(
-                                "[RenderProcess] action=add_tool_use tool=%s id=%s block_idx=%d",
-                                stream_event.tool_name or "-",
-                                stream_event.tool_use_id or "-",
-                                idx,
-                            )
-                        continue
-
-                    # -- Tool result: merge into existing tool block in thinking card --
-                    if stream_event.kind == "tool_result":
-                        if stream_event.tool_use_id and stream_event.tool_use_id in _tool_block_index:
-                            idx = _tool_block_index[stream_event.tool_use_id]
-                            old_block = _tool_blocks[idx]
-                            merged = self._merge_tool_stream_blocks(old_block, stream_event)
-                            if merged and merged != old_block:
-                                _tool_blocks[idx] = merged
-                                _thinking_dirty = True
-                                log.info(
-                                    "[RenderProcess] action=merge_tool_result tool=%s id=%s block_idx=%d",
-                                    stream_event.tool_name or "-",
-                                    stream_event.tool_use_id,
-                                    idx,
-                                )
+                    # Flush thinking card (includes tool calls)
+                    if _thinking_dirty and (_thinking_acc or _tool_blocks):
+                        _thinking_dirty = False
+                        full = _build_thinking_content()
+                        if _thinking_card_id:
+                            try:
+                                await self._update_card(_thinking_card_id, full)
+                            except Exception:
+                                log.debug("flush thinking card update failed")
                         else:
-                            # Unbound tool result — add as standalone block
+                            _thinking_card_id = await self._reply_card(msg_id, full)
+
+                    # Flush result card
+                    if _result_dirty and _result_acc:
+                        _result_dirty = False
+                        await _ensure_thinking_card()
+                        full = "".join(_result_acc)
+                        if _result_card_id:
+                            try:
+                                await self._update_card(_result_card_id, full)
+                            except Exception:
+                                log.debug("flush result card update failed")
+                        else:
+                            _result_card_id = await self._reply_card(msg_id, full)
+
+            flush_task = asyncio.create_task(_flush_cards())
+
+            try:
+                async for event in self.bridge.stream_ask(topic_id, text, image_paths=image_paths or None, file_paths=file_paths or None):
+                    if event["type"] == "stream_event":
+                        saw_stream_event = True
+                        stream_event = event["event"]
+                        log.info(
+                            "[RenderEvent] kind=%s tool=%s text_len=%d preview=%r",
+                            stream_event.kind,
+                            stream_event.tool_name or "-",
+                            len(stream_event.text),
+                            _preview_text(stream_event.text),
+                        )
+
+                        # -- Thinking: accumulate into thinking card --
+                        if stream_event.kind == "thinking" and stream_event.text:
+                            _thinking_acc.append(stream_event.text)
+                            _thinking_dirty = True
+                            continue
+
+                        # -- Result: accumulate into result card --
+                        if stream_event.kind == "result" and stream_event.text:
+                            _result_acc.append(stream_event.text)
+                            _result_dirty = True
+                            continue
+
+                        # -- Tool use: add block to thinking card --
+                        if stream_event.kind == "tool_use":
                             block = self._format_stream_event(stream_event)
                             if block:
+                                idx = len(_tool_blocks)
                                 _tool_blocks.append(block)
+                                if stream_event.tool_use_id:
+                                    _tool_block_index[stream_event.tool_use_id] = idx
                                 _thinking_dirty = True
                                 log.info(
-                                    "[RenderProcess] action=add_unbound_tool_result tool=%s id=%s",
+                                    "[RenderProcess] action=add_tool_use tool=%s id=%s block_idx=%d",
                                     stream_event.tool_name or "-",
                                     stream_event.tool_use_id or "-",
+                                    idx,
                                 )
-                        continue
+                            continue
 
-                    # -- Text events: accumulate for dedup tracking --
-                    if stream_event.kind == "text":
-                        streamed_texts.append(stream_event.text)
+                        # -- Tool result: merge into existing tool block in thinking card --
+                        if stream_event.kind == "tool_result":
+                            if stream_event.tool_use_id and stream_event.tool_use_id in _tool_block_index:
+                                idx = _tool_block_index[stream_event.tool_use_id]
+                                old_block = _tool_blocks[idx]
+                                merged = self._merge_tool_stream_blocks(old_block, stream_event)
+                                if merged and merged != old_block:
+                                    _tool_blocks[idx] = merged
+                                    _thinking_dirty = True
+                                    log.info(
+                                        "[RenderProcess] action=merge_tool_result tool=%s id=%s block_idx=%d",
+                                        stream_event.tool_name or "-",
+                                        stream_event.tool_use_id,
+                                        idx,
+                                    )
+                            else:
+                                # Unbound tool result — add as standalone block
+                                block = self._format_stream_event(stream_event)
+                                if block:
+                                    _tool_blocks.append(block)
+                                    _thinking_dirty = True
+                                    log.info(
+                                        "[RenderProcess] action=add_unbound_tool_result tool=%s id=%s",
+                                        stream_event.tool_name or "-",
+                                        stream_event.tool_use_id or "-",
+                                    )
+                            continue
 
-                    # Skip duplicate text/result events
-                    block = self._format_stream_event(stream_event)
-                    if not block:
-                        continue
-                    event_key = self._event_dedup_key(stream_event)
-                    if event_key and event_key in emitted_event_keys:
+                        # -- Text events: accumulate for dedup tracking --
+                        if stream_event.kind == "text":
+                            streamed_texts.append(stream_event.text)
+
+                        # Skip duplicate text/result events
+                        block = self._format_stream_event(stream_event)
+                        if not block:
+                            continue
+                        event_key = self._event_dedup_key(stream_event)
+                        if event_key and event_key in emitted_event_keys:
+                            log.info(
+                                "[RenderSkip] reason=dedup kind=%s key=%r",
+                                stream_event.kind,
+                                event_key,
+                            )
+                            continue
+                        if event_key:
+                            emitted_event_keys.add(event_key)
                         log.info(
-                            "[RenderSkip] reason=dedup kind=%s key=%r",
+                            "[RenderCard] mode=reply content_len=%d last_kind=%s",
+                            len(block),
                             stream_event.kind,
-                            event_key,
                         )
-                        continue
-                    if event_key:
-                        emitted_event_keys.add(event_key)
-                    log.info(
-                        "[RenderCard] mode=reply content_len=%d last_kind=%s",
-                        len(block),
-                        stream_event.kind,
-                    )
-                    await self._reply_card(msg_id, block)
-                elif event["type"] == "final":
-                    result = event["result"]
-        except Exception as e:
-            log.exception("Bridge error")
-            result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
+                        await self._reply_card(msg_id, block)
+                    elif event["type"] == "final":
+                        result = event["result"]
+            except Exception as e:
+                log.exception("Bridge error")
+                result = StreamResult(assistant_texts=[f"❌ Error: {e}"])
 
-        # -- Cancel background flusher --
-        flush_task.cancel()
-        try:
-            await flush_task
-        except asyncio.CancelledError:
-            pass
+            # -- Cancel background flusher --
+            flush_task.cancel()
+            try:
+                await flush_task
+            except asyncio.CancelledError:
+                pass
 
-        # -- Final flush -- ensure all accumulated content is displayed --
-        # Order matters: thinking (with tools) -> result
-        if _thinking_acc or _tool_blocks:
-            # Change header from "Thinking..." to "Thinking" for final state
-            full = _build_thinking_content().replace("Thinking...", "Thinking", 1)
-            if _thinking_card_id:
-                try:
-                    await self._update_card(_thinking_card_id, full)
-                except Exception:
-                    pass
-            else:
-                _thinking_card_id = await self._reply_card(msg_id, full)
+            # -- Final flush -- ensure all accumulated content is displayed --
+            # Order matters: thinking (with tools) -> result
+            if _thinking_acc or _tool_blocks:
+                # Change header from "Thinking..." to "Thinking" for final state
+                full = _build_thinking_content().replace("Thinking...", "Thinking", 1)
+                if _thinking_card_id:
+                    try:
+                        await self._update_card(_thinking_card_id, full)
+                    except Exception:
+                        pass
+                else:
+                    _thinking_card_id = await self._reply_card(msg_id, full)
 
-        if _result_acc:
-            full = "".join(_result_acc)
-            if _result_card_id:
-                try:
-                    await self._update_card(_result_card_id, full)
-                except Exception:
-                    log.warning("[FinalFlush] update result card %s failed, will retry", _result_card_id)
-                    # Retry once after a short delay
-                    await asyncio.sleep(1.0)
+            if _result_acc:
+                full = "".join(_result_acc)
+                if _result_card_id:
                     try:
                         await self._update_card(_result_card_id, full)
                     except Exception:
-                        log.error("[FinalFlush] retry update result card %s also failed", _result_card_id)
-            elif full.strip():
-                # Ensure thinking card exists before creating result card
-                if (_thinking_acc or _tool_blocks) and not _thinking_card_id:
-                    pass  # Already handled above
-                card_id = await self._reply_card(msg_id, full)
-                if card_id is None and full.strip():
-                    # Card creation failed -- retry after delay
-                    log.warning("[FinalFlush] reply_card returned None for result (%d chars), retrying in 2s", len(full))
-                    await asyncio.sleep(2.0)
+                        log.warning("[FinalFlush] update result card %s failed, will retry", _result_card_id)
+                        # Retry once after a short delay
+                        await asyncio.sleep(1.0)
+                        try:
+                            await self._update_card(_result_card_id, full)
+                        except Exception:
+                            log.error("[FinalFlush] retry update result card %s also failed", _result_card_id)
+                elif full.strip():
+                    # Ensure thinking card exists before creating result card
+                    if (_thinking_acc or _tool_blocks) and not _thinking_card_id:
+                        pass  # Already handled above
                     card_id = await self._reply_card(msg_id, full)
-                    if card_id is None:
-                        log.error("[FinalFlush] retry reply_card also returned None -- user will NOT see result")
+                    if card_id is None and full.strip():
+                        # Card creation failed -- retry after delay
+                        log.warning("[FinalFlush] reply_card returned None for result (%d chars), retrying in 2s", len(full))
+                        await asyncio.sleep(2.0)
+                        card_id = await self._reply_card(msg_id, full)
+                        if card_id is None:
+                            log.error("[FinalFlush] retry reply_card also returned None -- user will NOT see result")
 
-        if not saw_stream_event:
-            card_content = self._format_result(result)
-            log.info("[RenderFallback] content_len=%d", len(card_content))
-            await self._reply_card(msg_id, card_content)
-        elif result.reply_text and not _result_acc:
-            final_text = result.reply_text
-            reply_so_far = "\n\n".join(streamed_texts).strip()
-            if final_text != reply_so_far:
-                final_key = ("result", final_text)
-                if final_key not in emitted_event_keys:
-                    log.info("[RenderFinalText] text_len=%d preview=%r", len(final_text), _preview_text(final_text))
-                    await self._reply_card(msg_id, final_text)
+            if not saw_stream_event:
+                card_content = self._format_result(result)
+                log.info("[RenderFallback] content_len=%d", len(card_content))
+                await self._reply_card(msg_id, card_content)
+            elif result.reply_text and not _result_acc:
+                final_text = result.reply_text
+                reply_so_far = "\n\n".join(streamed_texts).strip()
+                if final_text != reply_so_far:
+                    final_key = ("result", final_text)
+                    if final_key not in emitted_event_keys:
+                        log.info("[RenderFinalText] text_len=%d preview=%r", len(final_text), _preview_text(final_text))
+                        await self._reply_card(msg_id, final_text)
 
-        usage_text = self._format_usage_summary(result.usage)
-        if usage_text:
-            try:
-                log.info("[RenderUsage] content_len=%d", len(usage_text))
-                await self._reply_card(msg_id, usage_text)
-            except Exception:
-                log.exception("Reply usage card failed for %s", msg_id)
+            usage_text = self._format_usage_summary(result.usage)
+            if usage_text:
+                try:
+                    log.info("[RenderUsage] content_len=%d", len(usage_text))
+                    await self._reply_card(msg_id, usage_text)
+                except Exception:
+                    log.exception("Reply usage card failed for %s", msg_id)
 
-        await self._react(msg_id, "DONE")
-
-        # Clean up temp files
-        if all_temp_paths:
-            self._cleanup_inbound_attachments(all_temp_paths)
+            await self._react(msg_id, "DONE")
+        finally:
+            if all_temp_paths:
+                self._cleanup_inbound_attachments(all_temp_paths)
 
     @staticmethod
     def _event_dedup_key(event: StreamEvent) -> tuple[str, str] | None:

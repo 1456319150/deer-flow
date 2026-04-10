@@ -921,10 +921,9 @@ class ClaudeCodeBridge:
             parts.insert(0, f"--resume {session_id}")
         if self.allowed_tools:
             parts.append(f"--allowedTools {self.allowed_tools}")
-        # Add image paths for Claude vision
         if image_paths:
             for img_path in image_paths:
-                parts.append(f"--images {img_path}")
+                parts.append(f"--images {safe(img_path)}")
         return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
 
     def _build_cmd_codex(self, prompt: str, session_id: str | None, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> list[str]:
@@ -938,10 +937,9 @@ class ClaudeCodeBridge:
             parts = ["exec", "--yolo", "--json", "resume", session_id, safe(prompt)]
         else:
             parts = ["exec", "--yolo", "--json", safe(prompt)]
-        # Add image paths for Codex vision (note: --image singular, not --images)
         if image_paths:
             for img_path in image_paths:
-                parts.append(f"--image {img_path}")
+                parts.append(f"--image {safe(img_path)}")
         return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
 
 
