@@ -59,7 +59,6 @@ class FeishuBot:
             CreateMessageReactionRequest,
             CreateMessageReactionRequestBody,
             Emoji,
-            GetImageRequest,
             GetMessageResourceRequest,
             PatchMessageRequest,
             PatchMessageRequestBody,
@@ -80,7 +79,6 @@ class FeishuBot:
             "ReplyBody": ReplyMessageRequestBody,
             "CreateImageReq": CreateImageRequest,
             "CreateImageBody": CreateImageRequestBody,
-            "GetImageReq": GetImageRequest,
             "GetMsgResourceReq": GetMessageResourceRequest,
         }
 
@@ -116,18 +114,30 @@ class FeishuBot:
 
     # --- Inbound attachment helpers ---
 
-    async def _download_feishu_image(self, image_key: str) -> bytes | None:
-        """Download an image from Feishu by image_key."""
+    async def _download_feishu_image(self, msg_id: str, image_key: str) -> bytes | None:
+        """Download an image from Feishu via message_resource API.
+
+        The im.v1.image.get API only allows downloading images uploaded by the
+        bot itself.  For user-sent images we must use message_resource.get with
+        the originating message_id + image_key + type=image.
+        """
         try:
-            req = self._sdk["GetImageReq"].builder().image_key(image_key).build()
-            resp = await asyncio.to_thread(self._api_client.im.v1.image.get, req)
+            req = (
+                self._sdk["GetMsgResourceReq"]
+                .builder()
+                .message_id(msg_id)
+                .file_key(image_key)
+                .type("image")
+                .build()
+            )
+            resp = await asyncio.to_thread(self._api_client.im.v1.message_resource.get, req)
             if getattr(resp, "code", None) == 0 and resp.file:
                 data = resp.file.read()
-                log.info("[ImageDownload] ok key=%s size=%d", image_key, len(data))
+                log.info("[ImageDownload] ok key=%s msg=%s size=%d", image_key, msg_id, len(data))
                 return data
-            log.warning("[ImageDownload] API error key=%s code=%s", image_key, getattr(resp, "code", "?"))
+            log.warning("[ImageDownload] API error key=%s msg=%s code=%s", image_key, msg_id, getattr(resp, "code", "?"))
         except Exception:
-            log.warning("[ImageDownload] failed key=%s", image_key, exc_info=True)
+            log.warning("[ImageDownload] failed key=%s msg=%s", image_key, msg_id, exc_info=True)
         return None
 
     async def _download_feishu_file(self, msg_id: str, file_key: str, file_type: str = "file") -> bytes | None:
@@ -208,7 +218,7 @@ class FeishuBot:
             if msg_type == "image":
                 image_key = content.get("image_key", "")
                 if image_key:
-                    attachment_meta.append({"type": "image", "key": image_key, "name": ""})
+                    attachment_meta.append({"type": "image", "key": image_key, "name": "", "msg_id": msg_id})
                 text = ""  # image-only message, no text
                 log.info("[MSG] chat=%s msg=%s topic=%s type=image key=%s", chat_id, msg_id, topic_id, image_key)
             elif msg_type == "file":
@@ -262,7 +272,8 @@ class FeishuBot:
             os.makedirs(self._INBOUND_DIR, exist_ok=True)
             for att in attachment_meta:
                 if att["type"] == "image":
-                    data = await self._download_feishu_image(att["key"])
+                    att_msg_id = att.get("msg_id", msg_id)
+                    data = await self._download_feishu_image(att_msg_id, att["key"])
                     if data:
                         ext = self._guess_image_ext(data)
                         path = os.path.join(self._INBOUND_DIR, f"{att['key']}{ext}")
