@@ -233,7 +233,13 @@ class FeishuBot:
                 log.info("[MSG] chat=%s msg=%s topic=%s type=%s (unsupported)", chat_id, msg_id, topic_id, msg_type)
             else:
                 text = self._extract_text(content).strip()
-                log.info("[MSG] chat=%s msg=%s topic=%s text=%r", chat_id, msg_id, topic_id, text[:100])
+                if msg_type == "post":
+                    for ik in self._extract_post_image_keys(content):
+                        attachment_meta.append({"type": "image", "key": ik, "name": "", "msg_id": msg_id})
+                if attachment_meta:
+                    log.info("[MSG] chat=%s msg=%s topic=%s type=%s text=%r images=%d", chat_id, msg_id, topic_id, msg_type, text[:80], len(attachment_meta))
+                else:
+                    log.info("[MSG] chat=%s msg=%s topic=%s text=%r", chat_id, msg_id, topic_id, text[:100])
 
             # For image/file-only messages, provide a description as prompt
             if not text and attachment_meta:
@@ -910,9 +916,14 @@ class FeishuBot:
     def _extract_text(content: dict) -> str:
         if "text" in content:
             return content["text"]
-        if "content" in content and isinstance(content["content"], list):
+        body = content
+        for lang in ("zh_cn", "en_us", "ja_jp"):
+            if lang in content and isinstance(content[lang], dict):
+                body = content[lang]
+                break
+        if "content" in body and isinstance(body["content"], list):
             paras = []
-            for para in content["content"]:
+            for para in body["content"]:
                 if isinstance(para, list):
                     parts = [
                         el.get("text", "")
@@ -922,8 +933,33 @@ class FeishuBot:
                     joined = " ".join(p for p in parts if p)
                     if joined:
                         paras.append(joined)
-            return "\n\n".join(paras)
+            result = "\n\n".join(paras)
+            title = body.get("title", "")
+            if title and result:
+                return f"{title}\n\n{result}"
+            return result or title
         return ""
+
+    @staticmethod
+    def _extract_post_image_keys(content: dict) -> list[str]:
+        keys: list[str] = []
+        body = content
+        if "zh_cn" in content and isinstance(content["zh_cn"], dict):
+            body = content["zh_cn"]
+        elif "en_us" in content and isinstance(content["en_us"], dict):
+            body = content["en_us"]
+        paragraphs = body.get("content", [])
+        if not isinstance(paragraphs, list):
+            return keys
+        for para in paragraphs:
+            if not isinstance(para, list):
+                continue
+            for el in para:
+                if isinstance(el, dict) and el.get("tag") == "img":
+                    ik = el.get("image_key", "")
+                    if ik:
+                        keys.append(ik)
+        return keys
 
     @staticmethod
     def _log_err(fut: Any, msg_id: str) -> None:
