@@ -471,9 +471,9 @@ class TestBuildCmd(unittest.TestCase):
 
     def test_basic_cmd_structure(self):
         cmd = self.bridge._build_cmd("hello", None)
-        self.assertIn("ttadk", cmd[0])
-        self.assertIn("code", cmd)
-        self.assertIn("-t", cmd)
+        self.assertIn("aiden", cmd[0])
+        self.assertIn("x", cmd)
+        self.assertIn("claude", cmd)
 
     def test_stream_json_and_verbose(self):
         cmd = self.bridge._build_cmd("hello", None)
@@ -502,15 +502,15 @@ class TestBuildCmd(unittest.TestCase):
         args_str = " ".join(cmd)
         self.assertIn("--allowedTools Bash,Read", args_str)
 
-    def test_newline_escaping(self):
+    def test_newline_preserved_as_literal(self):
+        # argv-based subprocess: newlines pass through untouched to underlying CLI
         cmd = self.bridge._build_cmd("line1\nline2", None)
-        args_str = " ".join(cmd)
-        self.assertNotIn("\n", args_str)
+        self.assertIn("line1\nline2", cmd)
 
-    def test_single_quote_escaping(self):
+    def test_single_quote_preserved_as_literal(self):
+        # argv-based: single quotes pass through as literal chars (no shell escaping needed)
         cmd = self.bridge._build_cmd("it's a test", None)
-        args_str = " ".join(cmd)
-        self.assertIn("'\"'\"'", args_str)
+        self.assertIn("it's a test", cmd)
 
     def test_provider_defaults_to_claude(self):
         self.assertEqual(self.bridge.provider, "claude")
@@ -519,7 +519,8 @@ class TestBuildCmd(unittest.TestCase):
         bridge = ClaudeCodeBridge({"model": "gpt-5.4", "target": "codex"})
         self.assertEqual(bridge.provider, "codex")
         cmd = bridge._build_cmd("hello", None)
-        self.assertEqual(cmd[cmd.index("-t") + 1], "codex")
+        # aiden x codex ...
+        self.assertEqual(cmd[cmd.index("x") + 1], "codex")
 
     def test_provider_override_wins(self):
         bridge = ClaudeCodeBridge({"model": "gpt-5.4", "target": "claude", "provider": "codex"})
@@ -677,7 +678,7 @@ class TestBridgeAskMocked(unittest.TestCase):
     """Test ask() with mocked subprocess."""
 
     def test_missing_cmd_returns_error(self):
-        bridge = ClaudeCodeBridge({"ttadk_cmd": "nonexistent_cmd_99"})
+        bridge = ClaudeCodeBridge({"aiden_cmd": "nonexistent_cmd_99"})
         result = asyncio.run(bridge.ask("t1", "hi"))
         self.assertIsInstance(result, StreamResult)
         self.assertIn("not found", result.reply_text)
@@ -1588,7 +1589,7 @@ class TestToolUseRetry(unittest.IsolatedAsyncioTestCase):
 
     def _make_bridge(self):
         cfg = {
-            "ttadk_cmd": "echo",
+            "aiden_cmd": "echo",
             "model": "gpt-5.4",
             "target": "claude",
             "timeout": 10,

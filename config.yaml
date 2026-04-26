@@ -1,4 +1,4 @@
-# Feishu → Claude Code Gateway
+# Feishu → aiden (Claude Code / Codex) Gateway
 # Env vars: FEISHU_APP_ID, FEISHU_APP_SECRET
 
 # Provider selection: "claude" (default) or "mira"
@@ -9,9 +9,11 @@ feishu:
   app_secret: ${FEISHU_APP_SECRET}
 
 claude:
-  ttadk_cmd: ttadk           # or full path: /usr/local/bin/ttadk
-  model: gpt-5.4
-  target: codex
+  # aiden CLI binary. Install: npm install -g @aiden-cli/core --registry https://bnpm.byted.org
+  # First-time use: run `aiden x claude` once and complete SSO login via QR code.
+  aiden_cmd: aiden           # or full path: /usr/local/bin/aiden
+  model: gpt-5.4             # PTU: gpt-5.4, gpt-5.3-codex; aiden-d1o / aiden-d1s (whitelist)
+  target: codex              # "claude" → `aiden x claude`; "codex" → `aiden x codex`
   timeout: 600               # seconds
   session_store_path: .gateway-sessions.json
   # allowed_tools: "Bash,Read,Write,Edit,Glob,WebSearch,WebFetch"

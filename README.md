@@ -1,12 +1,12 @@
 # Feishu / WeChat → Claude Code Gateway
 
-Minimal relay: Feishu or WeChat messages → ttadk Claude Code → channel reply.
+Minimal relay: Feishu or WeChat messages → aiden (Claude Code / Codex) → channel reply.
 
 ## Architecture
 
 ```text
 Feishu user  ──WebSocket──→ FeishuBot  ──┐
-                                         ├──→ ClaudeCodeBridge ──subprocess──→ ttadk code
+                                         ├──→ ClaudeCodeBridge ──subprocess──→ aiden x (claude|codex)
 WeChat user ──HTTP long-poll──→ WeixinBot ─┘
 ```
 
@@ -14,7 +14,7 @@ WeChat user ──HTTP long-poll──→ WeixinBot ─┘
 |-----------|------|
 | `FeishuBot` | lark-oapi WebSocket listener, card reply/update |
 | `WeixinBot` | iLink long-poll listener, plain-text reply |
-| `ClaudeCodeBridge` | ttadk subprocess wrapper, session management |
+| `ClaudeCodeBridge` | aiden subprocess wrapper, session management |
 | `weixin_channel.py` | standalone iLink HTTP/JSON protocol client |
 
 ## vs DeerFlow
@@ -61,7 +61,7 @@ python gateway.py
 Multi-turn behavior:
 - Thread replies share the same `topic_id`
 - `topic_id = root_id or msg_id`
-- `topic_id` is mapped to ttadk `session_id` via `--resume`
+- `topic_id` is mapped to aiden underlying CLI `session_id` via `--resume`
 
 ### WeChat
 
@@ -87,7 +87,7 @@ feishu:
   app_secret: ${FEISHU_APP_SECRET}
 
 claude:
-  ttadk_cmd: ttadk
+  aiden_cmd: aiden
   model: gpt-5.4
   target: claude
   timeout: 600

@@ -63,7 +63,7 @@ class DebugBridge(ClaudeCodeBridge):
 
 async def main():
     bridge = DebugBridge({
-        "ttadk_cmd": "ttadk",
+        "aiden_cmd": "aiden",
         "model": "gpt-5.4",
         "target": "claude",
         "timeout": 120,

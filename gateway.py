@@ -1,6 +1,6 @@
 """Feishu → Claude Code Gateway
 
-Minimal relay: Feishu/WeChat messages in, ttadk Claude Code out.
+Minimal relay: Feishu/WeChat messages in, aiden (Claude Code / Codex) out.
 No LangGraph, no multi-agent, no frontend — just a message bridge.
 
 Architecture:
@@ -10,7 +10,7 @@ Architecture:
     weixin_channel.py — iLink protocol layer (login, poll, send)
 
 Session continuity:
-    topic_id → ttadk session_id via --resume
+    topic_id → aiden underlying CLI session_id via --resume
     Feishu: topic_id = root_id or msg_id
     WeChat: topic_id = wx_{from_user}
 
@@ -175,16 +175,172 @@ class StreamState:
 
 
 # ===========================================================================
+# Aiden SSO Login Detector
+# ===========================================================================
+
+class AidenLoginDetector:
+    """Detects aiden SSO login prompt in CLI stdout/stderr.
+
+    aiden first-launch prints an ANSI QR-code block, a device login URL, and
+    a user-code. If the gateway process is running headless (no interactive
+    terminal), we cannot scan the QR code — so we capture the prompt, kill
+    the subprocess, and relay the URL/usercode back to the end user so they
+    can complete login on their own phone/browser.
+
+    Detection is deliberately loose — we only need to catch the URL once,
+    then buffer a few surrounding lines for context.
+    """
+
+    # Matches: https://sso.bytedance.com/device?usercode=XXXX-XXXX
+    #          https://sso.byted.org/device?usercode=...
+    #          (and possible regional variants)
+    _URL_RE = re.compile(
+        r"https?://sso\.(?:bytedance\.com|byted\.org|bytedance\.net)/device[^\s]*",
+        re.IGNORECASE,
+    )
+    # Fallback: plain "Or enter code: XXXX-XXXX" line, or "Scan the following QR code"
+    _CODE_RE = re.compile(r"(?:enter code|user\s*code)[^A-Z0-9]*([A-Z0-9]{4}-[A-Z0-9]{4})", re.IGNORECASE)
+    _TRIGGER_KEYWORDS = ("Scan the following QR code", "Waiting for login", "Check user login status")
+    # QR code rows use half-block glyphs
+    _QR_CHARS = set("█▀▄▌▐░▒▓ ")
+
+    def __init__(self) -> None:
+        self.url: str | None = None
+        self.user_code: str | None = None
+        self.qr_lines: list[str] = []
+        self.context_lines: list[str] = []  # last ~25 raw lines captured during detection window
+        self._in_qr_block = False
+        self._triggered = False
+
+    @property
+    def triggered(self) -> bool:
+        """True once we have seen either the login URL or a clear trigger keyword."""
+        return self._triggered
+
+    @property
+    def has_actionable(self) -> bool:
+        """True when we have something useful to send to the user (URL or code)."""
+        return bool(self.url or self.user_code)
+
+    def feed(self, line: str) -> bool:
+        """Feed a single raw line (with or without trailing newline). Returns
+        True if this line contributes to a login prompt."""
+        text = line.rstrip("\n\r")
+        hit = False
+
+        if any(kw in text for kw in self._TRIGGER_KEYWORDS):
+            self._triggered = True
+            hit = True
+
+        m = self._URL_RE.search(text)
+        if m:
+            candidate = m.group(0)
+            # Prefer the URL that carries ?usercode=... — the bare "Manual login page"
+            # line appears later in aiden output and would otherwise overwrite it.
+            if self.url is None or ("usercode=" in candidate and "usercode=" not in (self.url or "")):
+                self.url = candidate
+            self._triggered = True
+            hit = True
+
+        m = self._CODE_RE.search(text)
+        if m:
+            self.user_code = m.group(1)
+            self._triggered = True
+            hit = True
+
+        # QR code block detection — a line is "mostly" block glyphs
+        stripped = text.strip()
+        if stripped and len(stripped) >= 10:
+            block_ratio = sum(1 for c in stripped if c in self._QR_CHARS) / len(stripped)
+            if block_ratio >= 0.6:
+                self._in_qr_block = True
+                self.qr_lines.append(text)
+                hit = True
+            elif self._in_qr_block:
+                # First non-QR line closes the block
+                self._in_qr_block = False
+
+        # Always buffer a rolling context window of raw lines when triggered
+        if self._triggered:
+            self.context_lines.append(text)
+            if len(self.context_lines) > 40:
+                self.context_lines.pop(0)
+
+        return hit
+
+    # --- Interactive y/N prompt detection (auto-confirm, do NOT surface to user) ---
+    # Examples observed in wild:
+    #   "Update available! Would you like to update? (Y/n)"
+    #   "Install @anthropic-ai/claude-code? [Y/n]"
+    #   "Proceed with installation? (y/N)"
+    #   "Continue? [y/N]"
+    # We trigger on any line containing a y/N or Y/n bracketed choice, or keywords
+    # like "update available", "install", "proceed", "continue?" combined with a
+    # question mark near end-of-line.
+    _CONFIRM_RE = re.compile(
+        r"(?:"
+        r"\[\s*[yY]\s*/\s*[nN]\s*\]"       # [Y/n] or [y/N]
+        r"|\(\s*[yY]\s*/\s*[nN]\s*\)"       # (Y/n) or (y/N)
+        r"|\b(?:proceed|continue|install|update|upgrade|overwrite|download)\b[^\n]{0,60}\?"
+        r")",
+        re.IGNORECASE,
+    )
+
+    def is_confirm_prompt(self, line: str) -> bool:
+        """Return True iff the line looks like a y/N confirmation prompt.
+
+        We exclude login-related trigger text (login prompts are handled separately
+        and need user intervention, not auto-confirm).
+        """
+        text = line.rstrip("\r\n")
+        if any(kw in text for kw in self._TRIGGER_KEYWORDS):
+            return False
+        if self._URL_RE.search(text):  # login URL line — not a confirm prompt
+            return False
+        return bool(self._CONFIRM_RE.search(text))
+
+    def build_user_message(self, aiden_cmd: str) -> str:
+        """Format a Feishu/WeChat-friendly notice the user can act on."""
+        parts: list[str] = [
+            "🔐 **Aiden 需要 SSO 登录**",
+            "",
+            f"Gateway 运行环境无法扫码，请在本地完成登录：",
+        ]
+        if self.url:
+            parts.append(f"")
+            parts.append(f"👉 **打开链接登录**：{self.url}")
+        if self.user_code:
+            parts.append(f"👉 **手动输入 code**：`{self.user_code}`")
+        parts.extend([
+            "",
+            f"登录成功后，请重新发送消息。若持续失败，可在本地终端运行 `{aiden_cmd} x claude` 完成一次登录即可。",
+        ])
+        if self.qr_lines:
+            parts.append("")
+            parts.append("<details>终端原始二维码（ANSI，终端打开查看）</details>")
+            parts.append("```")
+            parts.extend(self.qr_lines)
+            parts.append("```")
+        return "\n".join(parts)
+
+
+# ===========================================================================
 # Claude Code Bridge
 # ===========================================================================
 
 class ClaudeCodeBridge:
-    """Wraps ttadk CLI to talk to Claude Code."""
+    """Wraps aiden CLI to talk to Claude Code / Codex.
+
+    aiden forwards unknown args to the underlying CLI, so native claude/codex
+    flags (e.g. -p, --resume, --output-format) are appended after aiden's own
+    options (--model, etc.).
+    """
 
     def __init__(self, cfg: dict):
-        self.ttadk_cmd: str = cfg.get("ttadk_cmd", "ttadk")
+        # Backward compat: prefer aiden_cmd, fall back to ttadk_cmd, then default "aiden"
+        self.aiden_cmd: str = cfg.get("aiden_cmd") or cfg.get("ttadk_cmd") or "aiden"
         self.model: str = cfg.get("model", "gpt-5.4")
-        self.target: str = cfg.get("target", "claude")
+        self.target: str = cfg.get("target", "claude")  # "claude" | "codex" → aiden x <target>
         self.provider: str = self._resolve_provider(cfg.get("provider"), self.target)
         self.timeout: int = cfg.get("timeout", 600)
         self.allowed_tools: str = cfg.get("allowed_tools", "")
@@ -273,21 +429,36 @@ class ClaudeCodeBridge:
 
         log.info("[Bridge] topic=%s session=%s prompt=%d chars", topic_id, session_id, len(prompt))
 
+        # Inherit parent env and overlay non-interactive hints. aiden / underlying CLIs
+        # (npm, claude, codex) honour a subset of these — enough to skip most y/N prompts
+        # (auto-update, install confirmations, telemetry opt-in, color tty detection).
+        child_env = os.environ.copy()
+        child_env.setdefault("CI", "1")                  # universal CI indicator
+        child_env.setdefault("NO_COLOR", "1")            # suppress ANSI where supported
+        child_env.setdefault("TERM", "dumb")             # disables TTY-fancy prompts
+        child_env.setdefault("npm_config_yes", "true")   # npm auto-yes (aiden wraps npm installs)
+        child_env.setdefault("AIDEN_NON_INTERACTIVE", "1")  # speculative; harmless if unused
+        child_env.setdefault("AIDEN_AUTO_UPDATE", "0")   # decline auto-update offers
+        child_env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE,           # keep open so we can feed "y\n" on demand
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,  # separate pipe
+                stderr=asyncio.subprocess.PIPE,          # separate pipe
+                env=child_env,
                 limit=10 * 1024 * 1024,  # 10MB; default 64KB too small for Claude Code output
             )
         except FileNotFoundError:
-            r = StreamResult(assistant_texts=[f"❌ Command not found: {self.ttadk_cmd}. Is ttadk installed and in PATH?"])
+            r = StreamResult(assistant_texts=[f"❌ Command not found: {self.aiden_cmd}. Is aiden CLI installed and in PATH?"])
             yield {"type": "final", "result": r}
             return
 
         state = StreamState()
         output_len = 0
+        login_detector = AidenLoginDetector()
+        login_abort = False  # flips to True once we decide to short-circuit due to SSO login prompt
 
         # DIAG: line counters + raw tail buffer for empty-result diagnostics
         json_line_count = 0
@@ -308,17 +479,55 @@ class ClaudeCodeBridge:
                         line = await proc.stderr.readline()
                         if not line:
                             break
-                        text = line.decode("utf-8", errors="replace").strip()
-                        if text:
-                            stderr_lines.append(text)
-                            log.warning("[Bridge] [STDERR] %s", text)
+                        text = line.decode("utf-8", errors="replace")
+                        # Feed raw (with newline trimmed inside detector) to catch login hints on stderr too
+                        login_detector.feed(text)
+                        _stdin_e = getattr(proc, "stdin", None)
+                        if _stdin_e is not None and not _stdin_e.is_closing() \
+                                and login_detector.is_confirm_prompt(text):
+                            log.info("[Bridge] [STDERR] auto-confirming interactive prompt: %s", text.strip()[:200])
+                            try:
+                                _stdin_e.write(b"y\n")
+                                await _stdin_e.drain()
+                            except (BrokenPipeError, ConnectionResetError):
+                                pass
+                        stripped = text.strip()
+                        if stripped:
+                            stderr_lines.append(stripped)
+                            log.warning("[Bridge] [STDERR] %s", stripped)
 
                 stderr_task = asyncio.create_task(_drain_stderr())
                 while True:
                     line = await proc.stdout.readline()
                     if not line:
                         break
-                    decoded = line.decode("utf-8", errors="replace")
+                    decoded_raw = line.decode("utf-8", errors="replace")
+                    # Feed login detector BEFORE any JSON parsing; aiden prints login text before stream-json starts
+                    login_detector.feed(decoded_raw)
+                    # Auto-confirm y/N interactive prompts (update, install, proceed, etc.)
+                    # Do not surface these to the user — just answer "y" on their behalf.
+                    _stdin = getattr(proc, "stdin", None)
+                    if _stdin is not None and not _stdin.is_closing() \
+                            and login_detector.is_confirm_prompt(decoded_raw):
+                        log.info("[Bridge] auto-confirming interactive prompt: %s", decoded_raw.strip()[:200])
+                        try:
+                            _stdin.write(b"y\n")
+                            await _stdin.drain()
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                    if login_detector.has_actionable and not login_abort:
+                        log.warning(
+                            "[Bridge] detected aiden SSO login prompt: url=%s code=%s — aborting subprocess",
+                            login_detector.url, login_detector.user_code,
+                        )
+                        login_abort = True
+                        # Kill aiden immediately; no point waiting on unattended login
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        break
+                    decoded = decoded_raw
                     output_len += len(decoded)
 
                     # DIAG: classify and buffer raw lines
@@ -349,6 +558,12 @@ class ClaudeCodeBridge:
                 if stderr_task is not None:
                     await stderr_task
                 log.warning(f"[Bridge] process exited: returncode={proc.returncode}")
+
+            if login_abort and login_detector.has_actionable:
+                msg = login_detector.build_user_message(self.aiden_cmd)
+                r = StreamResult(assistant_texts=[msg])
+                yield {"type": "final", "result": r}
+                return
         except TimeoutError:
             log.error(f"[Bridge] TIMEOUT after {self.timeout}s, killing process")
             if stderr_task is not None:
@@ -910,21 +1125,21 @@ class ClaudeCodeBridge:
             file_refs = "\n".join(f"[附件: {p}]" for p in file_paths)
             prompt = f"{file_refs}\n\n{prompt}"
 
-        safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
-        parts = [
-            f"-p {safe(prompt)}",
-            "--dangerously-skip-permissions",
-            "--output-format stream-json",
-            "--verbose",
-        ]
+        # aiden forwards unknown args to Claude Code CLI; no need for -a "<shell-escaped>" wrapper.
+        # Build a proper argv list to avoid any shell-escaping pitfalls.
+        argv: list[str] = [self.aiden_cmd, "x", "claude", "--model", self.model]
         if session_id:
-            parts.insert(0, f"--resume {session_id}")
+            argv.extend(["--resume", session_id])
+        argv.extend(["-p", prompt,
+                     "--dangerously-skip-permissions",
+                     "--output-format", "stream-json",
+                     "--verbose"])
         if self.allowed_tools:
-            parts.append(f"--allowedTools {self.allowed_tools}")
+            argv.extend(["--allowedTools", self.allowed_tools])
         if image_paths:
             for img_path in image_paths:
-                parts.append(f"--images {safe(img_path)}")
-        return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
+                argv.extend(["--images", img_path])
+        return argv
 
     def _build_cmd_codex(self, prompt: str, session_id: str | None, *, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> list[str]:
         # Prepend file references to prompt if files attached
@@ -932,15 +1147,16 @@ class ClaudeCodeBridge:
             file_refs = "\n".join(f"[附件: {p}]" for p in file_paths)
             prompt = f"{file_refs}\n\n{prompt}"
 
-        safe = lambda s: "'" + s.replace("\n", "\\n").replace("\r", "").replace("'", "'\"'\"'") + "'"
+        # aiden forwards unknown args to Codex CLI.
+        argv: list[str] = [self.aiden_cmd, "x", "codex", "--model", self.model,
+                           "exec", "--yolo", "--json"]
         if session_id:
-            parts = ["exec", "--yolo", "--json", "resume", session_id, safe(prompt)]
-        else:
-            parts = ["exec", "--yolo", "--json", safe(prompt)]
+            argv.extend(["resume", session_id])
+        argv.append(prompt)
         if image_paths:
             for img_path in image_paths:
-                parts.append(f"--image {safe(img_path)}")
-        return [self.ttadk_cmd, "code", "-t", self.target, "-m", self.model, "-a", " ".join(parts)]
+                argv.extend(["--image", img_path])
+        return argv
 
 
 # ===========================================================================

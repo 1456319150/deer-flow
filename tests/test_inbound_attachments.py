@@ -211,35 +211,35 @@ class TestBuildCmdClaudeAttachments:
 
     @pytest.fixture
     def bridge(self):
-        cfg = {"ttadk_cmd": "ttadk", "model": "test-model", "target": "claude"}
+        cfg = {"aiden_cmd": "aiden", "model": "test-model", "target": "claude"}
         return ClaudeCodeBridge(cfg)
 
     def test_no_attachments(self, bridge):
         cmd = bridge._build_cmd_claude("hello", None)
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "--images" not in args_str
         assert "[附件:" not in args_str
 
     def test_single_image(self, bridge):
         cmd = bridge._build_cmd_claude("hello", None, image_paths=["/tmp/img.png"])
-        args_str = cmd[-1]
-        assert "--images '/tmp/img.png'" in args_str
+        args_str = " ".join(cmd)
+        assert "--images /tmp/img.png" in args_str
 
     def test_multiple_images(self, bridge):
         cmd = bridge._build_cmd_claude("hello", None, image_paths=["/tmp/a.png", "/tmp/b.jpg"])
-        args_str = cmd[-1]
-        assert "--images '/tmp/a.png'" in args_str
-        assert "--images '/tmp/b.jpg'" in args_str
+        args_str = " ".join(cmd)
+        assert "--images /tmp/a.png" in args_str
+        assert "--images /tmp/b.jpg" in args_str
 
     def test_single_file(self, bridge):
         cmd = bridge._build_cmd_claude("analyze this", None, file_paths=["/tmp/doc.pdf"])
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "[附件: /tmp/doc.pdf]" in args_str
         assert "analyze this" in args_str
 
     def test_multiple_files(self, bridge):
         cmd = bridge._build_cmd_claude("read these", None, file_paths=["/tmp/a.pdf", "/tmp/b.docx"])
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "[附件: /tmp/a.pdf]" in args_str
         assert "[附件: /tmp/b.docx]" in args_str
 
@@ -249,24 +249,24 @@ class TestBuildCmdClaudeAttachments:
             image_paths=["/tmp/screenshot.png"],
             file_paths=["/tmp/report.pdf"],
         )
-        args_str = cmd[-1]
-        assert "--images '/tmp/screenshot.png'" in args_str
+        args_str = " ".join(cmd)
+        assert "--images /tmp/screenshot.png" in args_str
         assert "[附件: /tmp/report.pdf]" in args_str
 
     def test_images_with_session_resume(self, bridge):
         cmd = bridge._build_cmd_claude("hello", "session_123", image_paths=["/tmp/img.png"])
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "--resume session_123" in args_str
-        assert "--images '/tmp/img.png'" in args_str
+        assert "--images /tmp/img.png" in args_str
 
     def test_none_image_paths_ignored(self, bridge):
         cmd = bridge._build_cmd_claude("hello", None, image_paths=None)
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "--images" not in args_str
 
     def test_empty_image_paths_ignored(self, bridge):
         cmd = bridge._build_cmd_claude("hello", None, image_paths=[])
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "--images" not in args_str
 
 
@@ -279,36 +279,36 @@ class TestBuildCmdCodexAttachments:
 
     @pytest.fixture
     def bridge(self):
-        cfg = {"ttadk_cmd": "ttadk", "model": "test-model", "target": "codex", "provider": "codex"}
+        cfg = {"aiden_cmd": "aiden", "model": "test-model", "target": "codex", "provider": "codex"}
         return ClaudeCodeBridge(cfg)
 
     def test_no_attachments(self, bridge):
         cmd = bridge._build_cmd_codex("hello", None)
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "--image" not in args_str
 
     def test_single_image_uses_singular_flag(self, bridge):
         cmd = bridge._build_cmd_codex("hello", None, image_paths=["/tmp/img.png"])
-        args_str = cmd[-1]
-        assert "--image '/tmp/img.png'" in args_str
+        args_str = " ".join(cmd)
+        assert "--image /tmp/img.png" in args_str
         assert "--images" not in args_str
 
     def test_multiple_images(self, bridge):
         cmd = bridge._build_cmd_codex("hello", None, image_paths=["/tmp/a.png", "/tmp/b.jpg"])
-        args_str = cmd[-1]
-        assert "--image '/tmp/a.png'" in args_str
-        assert "--image '/tmp/b.jpg'" in args_str
+        args_str = " ".join(cmd)
+        assert "--image /tmp/a.png" in args_str
+        assert "--image /tmp/b.jpg" in args_str
 
     def test_file_prepend(self, bridge):
         cmd = bridge._build_cmd_codex("analyze", None, file_paths=["/tmp/doc.pdf"])
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "[附件: /tmp/doc.pdf]" in args_str
 
     def test_images_with_session_resume(self, bridge):
         cmd = bridge._build_cmd_codex("hello", "sess_abc", image_paths=["/tmp/img.png"])
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "resume" in args_str
-        assert "--image '/tmp/img.png'" in args_str
+        assert "--image /tmp/img.png" in args_str
 
 
 # ===========================================================================
@@ -317,16 +317,16 @@ class TestBuildCmdCodexAttachments:
 
 class TestBuildCmdDispatch:
     def test_claude_provider_dispatches(self):
-        bridge = ClaudeCodeBridge({"ttadk_cmd": "ttadk", "model": "m", "target": "claude"})
+        bridge = ClaudeCodeBridge({"aiden_cmd": "aiden", "model": "m", "target": "claude"})
         cmd = bridge._build_cmd("hi", None, image_paths=["/tmp/x.png"])
-        args_str = cmd[-1]
-        assert "--images '/tmp/x.png'" in args_str
+        args_str = " ".join(cmd)
+        assert "--images /tmp/x.png" in args_str
 
     def test_codex_provider_dispatches(self):
-        bridge = ClaudeCodeBridge({"ttadk_cmd": "ttadk", "model": "m", "target": "codex", "provider": "codex"})
+        bridge = ClaudeCodeBridge({"aiden_cmd": "aiden", "model": "m", "target": "codex", "provider": "codex"})
         cmd = bridge._build_cmd("hi", None, image_paths=["/tmp/x.png"])
-        args_str = cmd[-1]
-        assert "--image '/tmp/x.png'" in args_str
+        args_str = " ".join(cmd)
+        assert "--image /tmp/x.png" in args_str
         assert "--images" not in args_str
 
 
@@ -337,7 +337,7 @@ class TestBuildCmdDispatch:
 class TestStreamAskRetryImagePaths(unittest.IsolatedAsyncioTestCase):
 
     def _make_bridge(self):
-        cfg = {"ttadk_cmd": "echo", "model": "m", "target": "claude"}
+        cfg = {"aiden_cmd": "echo", "model": "m", "target": "claude"}
         return ClaudeCodeBridge(cfg)
 
     async def test_images_only_on_first_attempt(self):
@@ -569,16 +569,16 @@ class TestEndToEndAttachmentFlow:
 class TestEdgeCases:
 
     def test_build_cmd_claude_special_chars_in_file_path(self):
-        bridge = ClaudeCodeBridge({"ttadk_cmd": "ttadk", "model": "m", "target": "claude"})
+        bridge = ClaudeCodeBridge({"aiden_cmd": "aiden", "model": "m", "target": "claude"})
         cmd = bridge._build_cmd_claude("hi", None, file_paths=["/tmp/my file.pdf"])
-        args_str = cmd[-1]
+        args_str = " ".join(cmd)
         assert "[附件: /tmp/my file.pdf]" in args_str
 
     def test_build_cmd_codex_special_chars_in_image_path(self):
-        bridge = ClaudeCodeBridge({"ttadk_cmd": "ttadk", "model": "m", "target": "codex", "provider": "codex"})
+        bridge = ClaudeCodeBridge({"aiden_cmd": "aiden", "model": "m", "target": "codex", "provider": "codex"})
         cmd = bridge._build_cmd_codex("hi", None, image_paths=["/tmp/my image.png"])
-        args_str = cmd[-1]
-        assert "--image '/tmp/my image.png'" in args_str
+        args_str = " ".join(cmd)
+        assert "--image /tmp/my image.png" in args_str
 
     def test_guess_image_ext_with_gif87a(self):
         from feishu_bot import FeishuBot

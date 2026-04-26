@@ -1,4 +1,4 @@
-"""Simulate Feishu messages through the gateway (no Feishu needed, real ttadk).
+"""Simulate Feishu messages through the gateway (no Feishu needed, real aiden).
 
 Usage: python test_e2e.py
 """
@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 
 async def main():
     bridge = ClaudeCodeBridge({
-        "ttadk_cmd": "ttadk",
+        "aiden_cmd": "aiden",
         "model": "gpt-5.4",
         "target": "claude",
         "timeout": 120,
