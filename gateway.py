@@ -444,7 +444,7 @@ class ClaudeCodeBridge:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdin=asyncio.subprocess.PIPE,           # keep open so we can feed "y\n" on demand
+                stdin=asyncio.subprocess.PIPE,           # open then immediately EOF; see below
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,          # separate pipe
                 env=child_env,
@@ -454,6 +454,17 @@ class ClaudeCodeBridge:
             r = StreamResult(assistant_texts=[f"❌ Command not found: {self.aiden_cmd}. Is aiden CLI installed and in PATH?"])
             yield {"type": "final", "result": r}
             return
+
+        # Close stdin immediately: Codex `exec` blocks on "Reading additional
+        # input from stdin…" whenever stdin is a pipe that hasn't seen EOF.
+        # aiden's own interactive prompts (upgrade, login, etc.) are suppressed
+        # via env vars (AIDEN_AUTO_UPDATE=0, npm_config_yes=true, CI=1), so we
+        # don't need a live stdin for auto-confirm anymore.
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
 
         state = StreamState()
         output_len = 0
@@ -482,15 +493,6 @@ class ClaudeCodeBridge:
                         text = line.decode("utf-8", errors="replace")
                         # Feed raw (with newline trimmed inside detector) to catch login hints on stderr too
                         login_detector.feed(text)
-                        _stdin_e = getattr(proc, "stdin", None)
-                        if _stdin_e is not None and not _stdin_e.is_closing() \
-                                and login_detector.is_confirm_prompt(text):
-                            log.info("[Bridge] [STDERR] auto-confirming interactive prompt: %s", text.strip()[:200])
-                            try:
-                                _stdin_e.write(b"y\n")
-                                await _stdin_e.drain()
-                            except (BrokenPipeError, ConnectionResetError):
-                                pass
                         stripped = text.strip()
                         if stripped:
                             stderr_lines.append(stripped)
@@ -506,15 +508,6 @@ class ClaudeCodeBridge:
                     login_detector.feed(decoded_raw)
                     # Auto-confirm y/N interactive prompts (update, install, proceed, etc.)
                     # Do not surface these to the user — just answer "y" on their behalf.
-                    _stdin = getattr(proc, "stdin", None)
-                    if _stdin is not None and not _stdin.is_closing() \
-                            and login_detector.is_confirm_prompt(decoded_raw):
-                        log.info("[Bridge] auto-confirming interactive prompt: %s", decoded_raw.strip()[:200])
-                        try:
-                            _stdin.write(b"y\n")
-                            await _stdin.drain()
-                        except (BrokenPipeError, ConnectionResetError):
-                            pass
                     if login_detector.has_actionable and not login_abort:
                         log.warning(
                             "[Bridge] detected aiden SSO login prompt: url=%s code=%s — aborting subprocess",
