@@ -30,6 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
+from urllib.parse import quote
 
 import aiohttp
 
@@ -49,6 +50,14 @@ SESSION_EXPIRED_CODE = -14
 # ===========================================================================
 
 @dataclass
+class WeixinMedia:
+    """Parsed inbound media reference from WeChat."""
+    url: str
+    aes_key: str = ""
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
 class WeixinMessage:
     """Parsed inbound message from WeChat."""
     from_user: str
@@ -56,11 +65,13 @@ class WeixinMessage:
     context_token: str
     msg_id: str = ""
     timestamp: int = 0
+    image_urls: list[str] = field(default_factory=list)
+    image_media: list[WeixinMedia] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
-        return not self.text.strip()
+        return not self.text.strip() and not self.image_urls and not self.image_media
 
 
 @dataclass
@@ -122,6 +133,64 @@ def _extract_text(msg: dict) -> str:
         if item.get("type") == 1 and item.get("text_item"):
             parts.append(item["text_item"].get("text", ""))
     return "".join(parts)
+
+
+def _has_non_text_items(msg: dict) -> bool:
+    """Return True for image/file/etc. messages mixed into item_list."""
+    for item in msg.get("item_list", []):
+        if not (item.get("type") == 1 and item.get("text_item")):
+            return True
+    return False
+
+
+def _extract_image_media(msg: dict) -> list[WeixinMedia]:
+    """Extract image media references from non-text iLink item payloads."""
+    media_refs: list[WeixinMedia] = []
+    seen_urls: set[str] = set()
+
+    def collect(value: object) -> tuple[list[str], str]:
+        urls: list[str] = []
+        aes_key = ""
+        if isinstance(value, dict):
+            for k, v in value.items():
+                key = str(k).lower()
+                if isinstance(v, str) and v.startswith(("http://", "https://")):
+                    if "url" in key or "uri" in key:
+                        urls.append(v)
+                elif isinstance(v, str) and key in {"encrypt_query_param", "encrypted_query_param"}:
+                    urls.append(
+                        "https://novac2c.cdn.weixin.qq.com/c2c/download"
+                        f"?encrypted_query_param={quote(v, safe='')}"
+                    )
+                elif isinstance(v, str) and "aes" in key and "key" in key:
+                    aes_key = aes_key or v
+                else:
+                    child_urls, child_key = collect(v)
+                    urls.extend(child_urls)
+                    aes_key = aes_key or child_key
+        elif isinstance(value, list):
+            for item in value:
+                child_urls, child_key = collect(item)
+                urls.extend(child_urls)
+                aes_key = aes_key or child_key
+        return urls, aes_key
+
+    for item in msg.get("item_list", []):
+        if item.get("type") == 1 and item.get("text_item"):
+            continue
+        urls, aes_key = collect(item)
+        raw = item if isinstance(item, dict) else {}
+        for url in urls:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            media_refs.append(WeixinMedia(url=url, aes_key=aes_key, raw=raw))
+    return media_refs
+
+
+def _extract_image_urls(msg: dict) -> list[str]:
+    """Extract image URLs from non-text iLink item payloads."""
+    return [m.url for m in _extract_image_media(msg)]
 
 
 def strip_markdown(text: str) -> str:
@@ -409,12 +478,26 @@ class WeixinChannel:
                 continue
 
             from_user = msg.get("from_user_id", "")
-            context_token = msg.get("context_token", "")
+            raw_context_token = msg.get("context_token", "")
             text = _extract_text(msg)
+            has_non_text_items = _has_non_text_items(msg)
+            image_media = _extract_image_media(msg)
+            image_urls = [m.url for m in image_media]
+            context_token = raw_context_token
 
-            # Cache context_token for future replies
-            if from_user and context_token:
-                self.ctx_store.set(from_user, context_token)
+            # Image/file messages may carry a one-off context_token that opens a
+            # separate WeChat context. Prefer the user's existing token so replies
+            # stay in the active conversation; use the inbound token only as fallback.
+            if from_user and raw_context_token:
+                if has_non_text_items:
+                    stored = self.ctx_store.get(from_user)
+                    if stored:
+                        context_token = stored
+                        log.info("Using stored context_token for non-text message from %s", from_user)
+                    else:
+                        self.ctx_store.set(from_user, raw_context_token)
+                else:
+                    self.ctx_store.set(from_user, raw_context_token)
 
             messages.append(WeixinMessage(
                 from_user=from_user,
@@ -422,6 +505,8 @@ class WeixinChannel:
                 context_token=context_token,
                 msg_id=msg.get("msg_id", ""),
                 timestamp=msg.get("timestamp", 0),
+                image_urls=image_urls,
+                image_media=image_media,
                 raw=msg,
             ))
 
@@ -477,6 +562,18 @@ class WeixinChannel:
                 await asyncio.sleep(0.5)  # Rate limit between chunks
 
         return last_result
+
+    async def download_url(self, url: str) -> tuple[bytes, str]:
+        """Download an inbound media URL using the same iLink auth context."""
+        session = await self._ensure_session()
+        async with session.get(
+            url,
+            headers=_headers(self.account.bot_token),
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.read()
+            return data, resp.headers.get("Content-Type", "")
 
     # --- Typing indicator ---
 

@@ -12,15 +12,18 @@ Integration:
 from __future__ import annotations
 
 import asyncio
-import json
+import base64
+import binascii
 import logging
 import os
+import shutil
+import subprocess
 import time
-from typing import Any
+from urllib.parse import urlparse
 
 from weixin_channel import (
-    WeixinAccount,
     WeixinChannel,
+    WeixinMedia,
     WeixinMessage,
     ContextTokenStore,
     SyncCursor,
@@ -48,6 +51,8 @@ class WeixinBot:
     """
 
     MSG_MAX_AGE = 120     # Skip messages older than 2 min (offline replay)
+    _INBOUND_DIR = "/tmp/deerflow_weixin_inbound"
+    _MIRA_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
     def __init__(self, cfg: dict, bridge: ClaudeCodeBridge):
         self.bridge = bridge
@@ -128,10 +133,19 @@ class WeixinBot:
         text = msg.text.strip()
         from_user = msg.from_user
         ctx_token = msg.context_token
+        image_urls = list(getattr(msg, "image_urls", []) or [])
+        image_media = list(getattr(msg, "image_media", []) or [])
+        if not image_media and image_urls:
+            image_media = [WeixinMedia(url=u) for u in image_urls]
 
-        log.info("[WeixinBot] 收到消息 from=%s text=%r", from_user, text[:100])
+        if not text and image_media:
+            text = "[用户发送了图片]"
 
         topic_id = f"wx_{from_user}"
+        log.info(
+            "[WeixinBot] 收到消息 from=%s topic=%s text=%r images=%d",
+            from_user, topic_id, text[:100], len(image_media),
+        )
 
         control_reply = await self._handle_control_command(topic_id, text)
         if control_reply is not None:
@@ -144,12 +158,26 @@ class WeixinBot:
         if ctx_token:
             await self._channel.send_typing(from_user, ctx_token, typing=True)
 
-        # --- Route to Claude Code ---
+        # --- Download inbound images and route to Claude Code ---
+        image_paths: list[str] = []
+        all_temp_paths: list[str] = []
         try:
-            result = await self._process_with_streaming(topic_id, text, from_user, ctx_token)
+            if image_media:
+                image_paths = await self._download_images(image_media, msg.msg_id or "msg")
+                all_temp_paths.extend(image_paths)
+            result = await self._process_with_streaming(
+                topic_id,
+                text,
+                from_user,
+                ctx_token,
+                image_paths=image_paths or None,
+            )
         except Exception as e:
             log.exception("[WeixinBot] Bridge error")
             result = StreamResult(assistant_texts=[f"处理出错: {e}"])
+        finally:
+            if all_temp_paths:
+                self._cleanup_temp_files(all_temp_paths)
 
         # --- Send reply ---
         reply = self._format_reply(result)
@@ -190,23 +218,251 @@ class WeixinBot:
         return "当前还没有活动会话。"
 
     async def _process_with_streaming(
-        self, topic_id: str, text: str, from_user: str, ctx_token: str
+        self,
+        topic_id: str,
+        text: str,
+        from_user: str,
+        ctx_token: str,
+        *,
+        image_paths: list[str] | None = None,
+        file_paths: list[str] | None = None,
     ) -> StreamResult:
         """Call Bridge with streaming, send intermediate typing keepalive."""
         result: StreamResult | None = None
+        streamed_reply_chunks: list[str] = []
         last_typing_time = time.time()
 
-        async for event in self.bridge.stream_ask(topic_id, text):
+        kwargs: dict[str, list[str]] = {}
+        if image_paths:
+            kwargs["image_paths"] = image_paths
+        if file_paths:
+            kwargs["file_paths"] = file_paths
+
+        async for event in self.bridge.stream_ask(topic_id, text, **kwargs):
             if event["type"] == "final":
                 result = event["result"]
             elif event["type"] == "stream_event":
+                stream_event = event["event"]
+                if stream_event.kind in {"result", "text"} and stream_event.text:
+                    streamed_reply_chunks.append(stream_event.text)
                 # Keepalive typing every 5s during processing
                 now = time.time()
                 if now - last_typing_time > 5 and ctx_token:
                     await self._channel.send_typing(from_user, ctx_token, typing=True)
                     last_typing_time = now
 
-        return result or StreamResult()
+        result = result or StreamResult()
+        if not result.reply_text and streamed_reply_chunks:
+            result.result_text = "".join(streamed_reply_chunks)
+        return result
+
+    async def _download_images(self, image_media: list[WeixinMedia | str], msg_id: str) -> list[str]:
+        assert self._channel is not None
+        os.makedirs(self._INBOUND_DIR, exist_ok=True)
+        paths: list[str] = []
+        for idx, media in enumerate(image_media):
+            if isinstance(media, str):
+                media = WeixinMedia(url=media)
+            url = media.url
+            try:
+                data, content_type = await self._channel.download_url(url)
+                decrypted = self._decrypt_wechat_media(data, media.aes_key)
+                if decrypted:
+                    data = decrypted
+                    log.info("[WeixinBot] decrypted WeChat media url_path=%s", urlparse(url).path)
+
+                decoded = self._decode_wechat_xor_image(data)
+                if decoded:
+                    data, ext = decoded
+                    log.info("[WeixinBot] decoded WeChat XOR image url=%s ext=%s", url, ext)
+                else:
+                    ext = self._guess_image_ext(data, url, content_type)
+                    if ext == ".bin":
+                        log.warning(
+                            "[WeixinBot] unknown image format url_path=%s has_aes_key=%s content_type=%r head=%s",
+                            urlparse(url).path, bool(media.aes_key), content_type, data[:24].hex(),
+                        )
+                path = os.path.join(self._INBOUND_DIR, f"{msg_id}_{idx}{ext}")
+                with open(path, "wb") as f:
+                    f.write(data)
+                path = await asyncio.to_thread(self._ensure_supported_image_file, path, ext)
+                paths.append(path)
+                saved_size = os.path.getsize(path) if os.path.exists(path) else len(data)
+                log.info("[WeixinBot] saved image %s (%d bytes)", path, saved_size)
+            except Exception:
+                log.warning("[WeixinBot] failed to download image url=%s", url, exc_info=True)
+        return paths
+
+    @staticmethod
+    def _guess_image_ext(data: bytes, url: str = "", content_type: str = "") -> str:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return ".png"
+        if data[:2] == b"\xff\xd8":
+            return ".jpg"
+        if data[:4] == b"GIF8":
+            return ".gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return ".webp"
+        if data[:2] == b"BM":
+            return ".bmp"
+        if data[:4] in {b"II*\x00", b"MM\x00*"}:
+            return ".tiff"
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            brand = data[8:12].lower()
+            compatible = data[8:64].lower()
+            if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+                return ".heic"
+            if b"heic" in compatible or b"heif" in compatible:
+                return ".heic"
+            if brand in {b"avif", b"avis"} or b"avif" in compatible:
+                return ".avif"
+
+        ctype = content_type.lower().split(";", 1)[0].strip()
+        ctype_exts = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+            "image/tiff": ".tiff",
+            "image/heic": ".heic",
+            "image/heif": ".heic",
+            "image/avif": ".avif",
+        }
+        if ctype in ctype_exts:
+            return ctype_exts[ctype]
+
+        suffix = os.path.splitext(urlparse(url).path)[1].lower()
+        known_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".avif"}
+        return suffix if suffix in known_exts else ".bin"
+
+    @classmethod
+    def _decrypt_wechat_media(cls, data: bytes, aes_key: str = "") -> bytes | None:
+        key = cls._parse_wechat_aes_key(aes_key)
+        if not key:
+            return None
+
+        openssl = shutil.which("openssl")
+        if not openssl:
+            log.warning("[WeixinBot] cannot decrypt WeChat media: openssl not found")
+            return None
+
+        try:
+            proc = subprocess.run(
+                [openssl, "enc", "-d", "-aes-128-ecb", "-K", key.hex(), "-nosalt"],
+                input=data,
+                capture_output=True,
+                check=True,
+                timeout=20,
+            )
+            return proc.stdout
+        except Exception:
+            log.warning("[WeixinBot] failed to decrypt WeChat media", exc_info=True)
+            return None
+
+    @staticmethod
+    def _parse_wechat_aes_key(value: str = "") -> bytes | None:
+        value = (value or "").strip()
+        if not value:
+            return None
+
+        try:
+            raw_hex = bytes.fromhex(value)
+            if len(raw_hex) == 16:
+                return raw_hex
+        except ValueError:
+            pass
+
+        padded = value + ("=" * (-len(value) % 4))
+        decoded_variants: list[bytes] = []
+        for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                decoded = decoder(padded)
+            except (binascii.Error, ValueError):
+                continue
+            if decoded not in decoded_variants:
+                decoded_variants.append(decoded)
+
+        for decoded in decoded_variants:
+            if len(decoded) == 16:
+                return decoded
+            try:
+                decoded_hex = bytes.fromhex(decoded.decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if len(decoded_hex) == 16:
+                return decoded_hex
+        return None
+
+    @classmethod
+    def _decode_wechat_xor_image(cls, data: bytes) -> tuple[bytes, str] | None:
+        """Decode WeChat-style XOR-obfuscated image bytes when present."""
+        signatures = [
+            (b"\xff\xd8\xff", ".jpg"),
+            (b"\x89PNG\r\n\x1a\n", ".png"),
+            (b"GIF8", ".gif"),
+            (b"RIFF", ".webp"),
+        ]
+        for signature, ext in signatures:
+            if len(data) < len(signature):
+                continue
+            key = data[0] ^ signature[0]
+            if key == 0:
+                continue
+            if all((data[i] ^ key) == signature[i] for i in range(len(signature))):
+                decoded = bytes(b ^ key for b in data)
+                if ext != ".webp" or decoded[8:12] == b"WEBP":
+                    return decoded, ext
+        return None
+
+    @classmethod
+    def _ensure_supported_image_file(cls, path: str, ext: str) -> str:
+        ext = ext.lower()
+        if ext in cls._MIRA_IMAGE_EXTS:
+            return path
+
+        converted = os.path.splitext(path)[0] + ".jpg"
+        if cls._convert_image_to_jpeg(path, converted):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            log.info("[WeixinBot] converted image %s -> %s for upload", path, converted)
+            return converted
+
+        log.warning("[WeixinBot] image format %s may be rejected by Mira upload: %s", ext, path)
+        return path
+
+    @staticmethod
+    def _convert_image_to_jpeg(src: str, dst: str) -> bool:
+        sips = shutil.which("sips")
+        if not sips:
+            return False
+        try:
+            subprocess.run(
+                [sips, "-s", "format", "jpeg", src, "--out", dst],
+                check=True,
+                capture_output=True,
+                timeout=20,
+            )
+            return os.path.exists(dst) and os.path.getsize(dst) > 0
+        except Exception:
+            try:
+                if os.path.exists(dst):
+                    os.remove(dst)
+            except OSError:
+                pass
+            log.warning("[WeixinBot] failed to convert image for upload: %s", src, exc_info=True)
+            return False
+
+    @staticmethod
+    def _cleanup_temp_files(paths: list[str]) -> None:
+        for p in paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     @classmethod
     def _format_reply(cls, result: StreamResult) -> str:

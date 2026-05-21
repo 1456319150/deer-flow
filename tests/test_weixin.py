@@ -1,18 +1,22 @@
 import asyncio
+import base64
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
 from unittest.mock import AsyncMock
 
-from gateway import ClaudeCodeBridge, StreamResult, ToolCall, UsageSummary
+from gateway import ClaudeCodeBridge, StreamEvent, StreamResult, ToolCall, UsageSummary
 from weixin_bot import WeixinBot
 from weixin_channel import (
     ContextTokenStore,
     SyncCursor,
     WeixinAccount,
     WeixinChannel,
+    WeixinMedia,
+    WeixinMessage,
     strip_markdown,
     load_account,
     save_account,
@@ -156,6 +160,59 @@ class TestWeixinChannel(unittest.IsolatedAsyncioTestCase):
                 if os.path.exists(path):
                     os.unlink(path)
 
+    async def test_get_updates_keeps_stored_context_for_image_messages(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as ctx_f, tempfile.NamedTemporaryFile(suffix=".json", delete=False) as cursor_f:
+            ctx_path = ctx_f.name
+            cursor_path = cursor_f.name
+        try:
+            ctx_store = ContextTokenStore(ctx_path)
+            ctx_store.set("user-1", "ctx-existing")
+            sync_cursor = SyncCursor(cursor_path)
+            account = WeixinAccount(bot_token="token", baseurl="https://wx.example")
+            channel = WeixinChannel(account, ctx_store, sync_cursor)
+            session = _FakeSession([
+                {
+                    "get_updates_buf": "buf-next",
+                    "msgs": [
+                        {
+                            "from_user_id": "user-1",
+                            "context_token": "ctx-image-new",
+                            "message_type": 1,
+                            "msg_id": "msg-img",
+                            "timestamp": 1710000002,
+                            "item_list": [
+                                {
+                                    "type": 2,
+                                    "image_item": {
+                                        "media": {
+                                            "url": "https://example.com/a.png",
+                                            "aes_key": "MDEyMzQ1Njc4OWFiY2RlZg==",
+                                        }
+                                    },
+                                },
+                                {"type": 1, "text_item": {"text": "图片里的报错"}},
+                            ],
+                        },
+                    ],
+                }
+            ])
+            channel._ensure_session = AsyncMock(return_value=session)
+
+            messages = await channel._get_updates()
+
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0].from_user, "user-1")
+            self.assertEqual(messages[0].text, "图片里的报错")
+            self.assertEqual(messages[0].context_token, "ctx-existing")
+            self.assertEqual(messages[0].image_urls, ["https://example.com/a.png"])
+            self.assertEqual(len(messages[0].image_media), 1)
+            self.assertEqual(messages[0].image_media[0].aes_key, "MDEyMzQ1Njc4OWFiY2RlZg==")
+            self.assertEqual(ctx_store.get("user-1"), "ctx-existing")
+        finally:
+            for path in (ctx_path, cursor_path):
+                if os.path.exists(path):
+                    os.unlink(path)
+
     async def test_send_text_recovers_context_and_splits_long_messages(self):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as ctx_f, tempfile.NamedTemporaryFile(suffix=".json", delete=False) as cursor_f:
             ctx_path = ctx_f.name
@@ -235,6 +292,181 @@ class TestWeixinBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["prompt"], "hello from wechat")
         self.assertEqual(bot._channel.send_typing.await_count, 2)
         bot._channel.send_text.assert_awaited_once_with("user-1", "ctx-1", "你好")
+
+    async def test_handle_image_message_routes_to_same_weixin_topic_and_replies(self):
+        bridge = ClaudeCodeBridge({})
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+        bot._channel.download_url = AsyncMock(
+            return_value=(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20, "image/png")
+        )
+        seen = {}
+
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
+            seen["topic_id"] = topic_id
+            seen["prompt"] = prompt
+            seen["image_paths"] = list(kwargs.get("image_paths") or [])
+            self.assertEqual(len(seen["image_paths"]), 1)
+            self.assertTrue(os.path.exists(seen["image_paths"][0]))
+            yield {"type": "final", "result": StreamResult(assistant_texts=["看到了图片"])}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        msg = WeixinMessage(
+            msg_id="msg-img",
+            timestamp=time.time(),
+            text="",
+            from_user="user-1",
+            context_token="ctx-1",
+            image_urls=["https://example.com/a.png"],
+        )
+
+        await bot._handle_message(msg)
+
+        self.assertEqual(seen["topic_id"], "wx_user-1")
+        self.assertEqual(seen["prompt"], "[用户发送了图片]")
+        self.assertEqual(bot._channel.download_url.await_count, 1)
+        self.assertFalse(os.path.exists(seen["image_paths"][0]))
+        bot._channel.send_text.assert_awaited_once_with("user-1", "ctx-1", "看到了图片")
+
+    async def test_handle_heic_image_converts_to_jpeg_before_bridge(self):
+        bridge = ClaudeCodeBridge({})
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+        heic_data = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 32
+        bot._channel.download_url = AsyncMock(return_value=(heic_data, "application/octet-stream"))
+        seen = {}
+
+        original_convert = WeixinBot._convert_image_to_jpeg
+
+        def fake_convert(src, dst):
+            self.assertTrue(src.endswith(".heic"))
+            with open(dst, "wb") as f:
+                f.write(b"\xff\xd8\xff\xe0jpeg")
+            return True
+
+        WeixinBot._convert_image_to_jpeg = staticmethod(fake_convert)
+        try:
+            async def fake_stream_ask(topic_id, prompt, **kwargs):
+                seen["image_paths"] = list(kwargs.get("image_paths") or [])
+                self.assertEqual(len(seen["image_paths"]), 1)
+                self.assertTrue(seen["image_paths"][0].endswith(".jpg"))
+                self.assertTrue(os.path.exists(seen["image_paths"][0]))
+                yield {"type": "final", "result": StreamResult(assistant_texts=["看到了 HEIC 图片"])}
+
+            bot.bridge.stream_ask = fake_stream_ask
+            msg = WeixinMessage(
+                msg_id="msg-heic",
+                timestamp=time.time(),
+                text="",
+                from_user="user-1",
+                context_token="ctx-1",
+                image_urls=["https://example.com/photo"],
+            )
+
+            await bot._handle_message(msg)
+        finally:
+            WeixinBot._convert_image_to_jpeg = original_convert
+
+        self.assertFalse(os.path.exists(seen["image_paths"][0]))
+        bot._channel.send_text.assert_awaited_once_with("user-1", "ctx-1", "看到了 HEIC 图片")
+
+    async def test_handle_xor_obfuscated_wechat_image_decodes_before_bridge(self):
+        bridge = ClaudeCodeBridge({})
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+        jpeg_data = b"\xff\xd8\xff\xe0" + b"jpeg-body"
+        key = 0x5A
+        bot._channel.download_url = AsyncMock(
+            return_value=(bytes(b ^ key for b in jpeg_data), "application/octet-stream")
+        )
+        seen = {}
+
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
+            seen["image_paths"] = list(kwargs.get("image_paths") or [])
+            self.assertEqual(len(seen["image_paths"]), 1)
+            self.assertTrue(seen["image_paths"][0].endswith(".jpg"))
+            with open(seen["image_paths"][0], "rb") as f:
+                self.assertEqual(f.read(), jpeg_data)
+            yield {"type": "final", "result": StreamResult(assistant_texts=["看到了加密图片"])}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        msg = WeixinMessage(
+            msg_id="msg-xor",
+            timestamp=time.time(),
+            text="",
+            from_user="user-1",
+            context_token="ctx-1",
+            image_urls=["https://example.com/encrypted"],
+        )
+
+        await bot._handle_message(msg)
+
+        self.assertFalse(os.path.exists(seen["image_paths"][0]))
+        bot._channel.send_text.assert_awaited_once_with("user-1", "ctx-1", "看到了加密图片")
+
+    async def test_handle_aes_encrypted_wechat_image_decrypts_before_bridge(self):
+        if not shutil.which("openssl"):
+            self.skipTest("openssl not available")
+
+        bridge = ClaudeCodeBridge({})
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+        jpeg_data = b"\xff\xd8\xff\xe0jpeg-body"
+        key_hex = "000102030405060708090a0b0c0d0e0f"
+        cipher = bytes.fromhex("74379fff024d8a31efed7eff52dc2834")
+        bot._channel.download_url = AsyncMock(return_value=(cipher, ""))
+        seen = {}
+
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
+            seen["image_paths"] = list(kwargs.get("image_paths") or [])
+            self.assertEqual(len(seen["image_paths"]), 1)
+            self.assertTrue(seen["image_paths"][0].endswith(".jpg"))
+            with open(seen["image_paths"][0], "rb") as f:
+                self.assertEqual(f.read(), jpeg_data)
+            yield {"type": "final", "result": StreamResult(assistant_texts=["看到了 AES 图片"])}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        msg = WeixinMessage(
+            msg_id="msg-aes",
+            timestamp=time.time(),
+            text="",
+            from_user="user-1",
+            context_token="ctx-1",
+            image_media=[
+                WeixinMedia(
+                    url="https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=x",
+                    aes_key=key_hex,
+                )
+            ],
+        )
+
+        await bot._handle_message(msg)
+
+        self.assertFalse(os.path.exists(seen["image_paths"][0]))
+        bot._channel.send_text.assert_awaited_once_with("user-1", "ctx-1", "看到了 AES 图片")
+
+    async def test_handle_message_replies_with_streamed_result_when_final_empty(self):
+        bridge = ClaudeCodeBridge({})
+        bot = WeixinBot({"enabled": True}, bridge)
+        bot._channel = AsyncMock()
+
+        async def fake_stream_ask(topic_id, prompt, **kwargs):
+            yield {"type": "stream_event", "event": StreamEvent(kind="result", text="图片回答")}
+            yield {"type": "final", "result": StreamResult()}
+
+        bot.bridge.stream_ask = fake_stream_ask
+        msg = WeixinMessage(
+            msg_id="msg-stream-only",
+            timestamp=time.time(),
+            text="[用户发送了图片]",
+            from_user="user-1",
+            context_token="ctx-1",
+            image_urls=[],
+        )
+
+        await bot._handle_message(msg)
+
+        bot._channel.send_text.assert_awaited_once_with("user-1", "ctx-1", "图片回答")
 
     async def test_handle_message_sends_usage_as_second_message(self):
         bridge = ClaudeCodeBridge({})
@@ -413,6 +645,30 @@ class TestWeixinBot(unittest.IsolatedAsyncioTestCase):
         self.assertIn("缓存命中 tokens: 400", summary)
         self.assertIn("总 tokens: 1,654", summary)
         self.assertIn("金额: $0.0165", summary)
+
+    def test_guess_image_ext_detects_heic_and_avif(self):
+        heic = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 16
+        avif = b"\x00\x00\x00\x18ftypavif" + b"\x00" * 16
+
+        self.assertEqual(WeixinBot._guess_image_ext(heic), ".heic")
+        self.assertEqual(WeixinBot._guess_image_ext(avif), ".avif")
+        self.assertEqual(WeixinBot._guess_image_ext(b"", content_type="image/heif"), ".heic")
+
+    def test_decode_wechat_xor_image(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"png-body"
+        key = 0x33
+
+        decoded = WeixinBot._decode_wechat_xor_image(bytes(b ^ key for b in png))
+
+        self.assertEqual(decoded, (png, ".png"))
+
+    def test_parse_wechat_aes_key_formats(self):
+        raw = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+        hex_text = "000102030405060708090a0b0c0d0e0f"
+
+        self.assertEqual(WeixinBot._parse_wechat_aes_key(hex_text), raw)
+        self.assertEqual(WeixinBot._parse_wechat_aes_key(base64.b64encode(raw).decode()), raw)
+        self.assertEqual(WeixinBot._parse_wechat_aes_key(base64.b64encode(hex_text.encode()).decode()), raw)
 
 
 if __name__ == "__main__":
